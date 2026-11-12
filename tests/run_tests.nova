@@ -1,0 +1,359 @@
+# run_tests.nova - the whole suite, written in NovaLang so the same file runs on the bytecode VM
+# and on the self-hosted interpreter:
+#   python3 novalang/novalang.py tests/run_tests.nova
+#   python3 novalang/novalang.py --bootstrap tests/run_tests.nova
+# Run from the project root (fixtures are read relative to it). Pass --update to rewrite the goldens.
+# A fake sh() replays recorded command output from tests/fixtures, so nothing here depends on the machine.
+import "../src/kit.nova" as kit
+import "../src/battery_model.nova" as model
+import "../src/pipeline.nova" as pipeline
+import "../src/render_term.nova" as term
+import "../src/render_html.nova" as html
+import "../src/modules/cpu.nova" as cpu
+import "../src/modules/ram.nova" as ram
+import "../src/modules/disk.nova" as disk
+import "../src/modules/net.nova" as net
+import "../src/modules/clock.nova" as clock
+import "../src/modules/battery.nova" as battery
+
+let tally = {passed: 0, failed: 0}
+
+def check(name, got, want) {
+    if got == want {
+        tally.passed = tally.passed + 1
+    } else {
+        tally.failed = tally.failed + 1
+        print("FAIL " + name + ": got " + str(got) + ", want " + str(want))
+    }
+}
+
+def near(name, got, want, tolerance) {
+    if abs(got - want) <= tolerance {
+        tally.passed = tally.passed + 1
+    } else {
+        tally.failed = tally.failed + 1
+        print("FAIL " + name + ": got " + str(got) + ", want " + str(want) + " +/- " + str(tolerance))
+    }
+}
+
+# ---- replaying sh ----------------------------------------------------------------------------
+let FIX = "tests/fixtures/"
+let SYSCTL = {
+    "hw.memsize": "sysctl_memsize.txt",
+    "hw.ncpu": "sysctl_ncpu.txt",
+    "machdep.cpu.brand_string": "sysctl_brand.txt",
+    "vm.swapusage": "sysctl_swap.txt",
+    "kern.memorystatus_vm_pressure_level": "sysctl_pressure.txt"
+}
+
+# scenario: {io: file, pm: file, fail: command name that should throw}
+def make_sh(scenario) {
+    def run(argv) {
+        let name = split(argv[0], "/")[-1]
+        if "fail" in scenario and scenario.fail == name {
+            throw("simulated failure of " + name)
+        }
+        if name == "ps" {
+            if "pcpu" in argv[2] {
+                return read(FIX + "ps.txt")
+            }
+            return read(FIX + "ps_mem.txt")
+        }
+        if name == "sysctl" {
+            return read(FIX + SYSCTL[argv[2]])
+        }
+        if name == "ioreg" {
+            return read(FIX + scenario.io)
+        }
+        if name == "pmset" {
+            return read(FIX + scenario.pm)
+        }
+        let files = {top: "top.txt", vm_stat: "vm_stat.txt", df: "df_data.txt", netstat: "netstat_a.txt"}
+        return read(FIX + files[name])
+    }
+    return run
+}
+
+let LOG = []
+def log_into(message) {
+    append(LOG, message)
+}
+
+def context(sh, t, wall) {
+    return {sh: sh, t: t, wall: wall, log: log_into, iso: "2026-01-01T00:00:00+00:00"}
+}
+
+let WALL = 1767225600
+def discharging() {
+    return {io: "ioreg_discharging_65.txt", pm: "pmset_discharging.txt"}
+}
+
+# ---- kit -------------------------------------------------------------------------------------
+check("fixed 5.0", kit.fixed(5, 1), "5.0")
+check("fixed 0.05", kit.fixed(0.05, 2), "0.05")
+check("fixed negative", kit.fixed(-1.5, 1), "-1.5")
+check("fixed rounds to zero without a sign", kit.fixed(-0.04, 1), "0.0")
+check("fixed whole", kit.fixed(1234.5678, 0), "1235")
+check("fixed carries", kit.fixed(0.999, 2), "1.00")
+check("group digits", kit.group_digits(1234567), "1,234,567")
+check("signed64 wraps", kit.signed64(18446744073709551445), -171)
+check("signed64 leaves positives", kit.signed64(2100), 2100)
+check("signed64 boundary", kit.signed64(9223372036854775808), -9223372036854775808)
+check("to_num fallback", kit.to_num("abc", -7), -7)
+check("to_num reads", kit.to_num(" 12 ", 0), 12)
+check("has_prefix", kit.has_prefix("CPU usage: 1%", "CPU usage:"), true)
+check("has_prefix short text", kit.has_prefix("CP", "CPU usage:"), false)
+check("after", kit.after("a=b=c", "="), "b=c")
+check("after missing", kit.after("abc", "="), "")
+check("between", kit.between("a 'AC Power' b", "'", "'"), "AC Power")
+check("word_after", kit.word_after("page size of 16384 bytes", "page size of"), "16384")
+check("duration", kit.duration(11.75), "11:45")
+check("duration unknown", kit.duration(-1), "n/a")
+check("duration rolls minutes", kit.duration(1.999), "2:00")
+check("human bytes", kit.human_bytes(1536), "1.5 KB")
+check("human bytes small", kit.human_bytes(12), "12 B")
+check("bar", kit.bar(50, 10), "█████░░░░░")
+check("bar clamps", kit.bar(250, 4), "████")
+let flat = kit.flat_dict("{\"A\"=1,\"B\"=Yes,\"C\"=18446744073709551445}")
+check("flat_dict number", flat.A, 1)
+check("flat_dict text", flat.B, "Yes")
+check("flat_dict big integer is exact", flat.C, 18446744073709551445)
+let fields = kit.ioreg_fields("  |   \"Voltage\" = 11523\n  |   \"Odd\" = \"a\" = b")
+check("ioreg field", fields.Voltage, "11523")
+check("ioreg value that contains the separator", fields.Odd, "\"a\" = b")
+
+# ---- cpu / ram / disk / net / clock against the recorded commands ----------------------------
+let tick = context(make_sh(discharging()), 100, WALL)
+let state = pipeline.new_state()
+let c = cpu.sample(tick, state)
+check("cpu user is the LAST sample", c.user, 14.1)
+check("cpu system", c.system, 7.11)
+check("cpu idle", c.idle, 78.78)
+near("cpu total", c.total, 21.21, 0.001)
+check("cpu load", c.load, [3.02, 3.51, 3.42])
+check("cpu processes", c.processes, 542)
+check("cpu cores", c.cores, 8)
+check("cpu brand", c.brand, "Apple M1")
+check("cpu top count", len(c.top), 5)
+check("cpu top first", c.top[0], {pid: 414, cpu: 30.1, name: "WindowServer"})
+check("cpu name with spaces", c.top[2].name, "Claude Helper (Renderer)")
+
+let r = ram.sample(tick, state)
+check("ram total", r.total, 8589934592)
+check("ram used", r.used, 6456426496)
+check("ram used pct", r.used_pct, 75.2)
+check("ram wired", r.wired, 1503657984)
+check("ram compressed", r.compressed, 2950627328)
+check("ram app + wired + compressed = used", r.app + r.wired + r.compressed, r.used)
+check("ram pressure", r.pressure, "warning")
+near("ram swap used", r.swap_used, 2459.81 * 1048576, 1)
+check("ram top bytes", r.top[0].bytes, 505952 * 1024)
+
+let d = disk.sample(tick, state)
+check("disk total", d.total, 494384795648)
+check("disk used", d.used, 326878679040)
+check("disk pct", d.used_pct, 66.1)
+check("disk volume", d.volume, "/System/Volumes/Data")
+check("disk read total", d.read_total, "4123G")
+check("disk written total", d.written_total, "349G")
+
+let n1 = net.sample(tick, state)
+check("net rx total", n1.rx_total, 28667195742)
+check("net tx total", n1.tx_total, 28515111085)
+check("net first sample has no rate", n1.have_rate, false)
+check("net interfaces are physical only", n1.interfaces[-1], "en0")
+def bumped(argv) {
+    return replace_all(make_sh(discharging())(argv), "28667195742", "28669195742")
+}
+let n2 = net.sample(context(bumped, 102, WALL), state)
+check("net rate has a rate", n2.have_rate, true)
+check("net down is bytes over seconds", n2.down, 1000000)
+check("net up with no change", n2.up, 0)
+let n3 = net.sample(context(make_sh(discharging()), 104, WALL), state)
+check("net counter that goes backwards is a zero rate", n3.down, 0)
+
+let k = clock.sample(context(make_sh(discharging()), 1, WALL), state)
+check("clock time shape", len(k.time), 8)
+check("clock date shape", len(k.date), 10)
+check("clock UTC row", k.world[0].time, "00:00")
+check("clock New York row", k.world[1].time, "19:00")
+check("clock Tokyo row", k.world[3].time, "09:00")
+check("clock local row follows the machine's zone", k.world[0].time == "00:00" and k.time[:5] == format_time(WALL, "%H:%M"), true)
+
+# ---- the battery, from each recorded gauge state ---------------------------------------------
+let bs = pipeline.new_state()
+let b = battery.sample(context(make_sh(discharging()), 100, WALL), bs)
+check("discharging state", b.state, "discharging")
+check("current wraps to -171 mA", b.current_ma, -171)
+near("power from current x voltage", b.power_w, 1.970433, 0.00001)
+near("power agrees with the gauge's own figure", b.reported_power_w, 1.97, 0.00001)
+check("power error under 0.1 percent", abs(b.power_error_pct) < 0.1, true)
+near("health", b.health_pct, 76.8177, 0.001)
+near("runtime from instantaneous draw", b.runtime_h, 14.2277, 0.001)
+check("macOS minutes", b.macos_minutes, 705)
+check("gauge minutes", b.gauge_to_empty_minutes, 705)
+check("macOS percent", b.macos_percent, 65)
+check("macOS source", b.source, "Battery Power")
+check("cycles", b.cycles, 630)
+near("wear per cycle", b.wear.lost_per_cycle_mah, 1.8778, 0.001)
+check("below the service threshold", b.wear.below_service, true)
+check("no projection once below it", b.wear.cycles_to_service, -1)
+
+let chg = battery.sample(context(make_sh({io: "ioreg_charging_40.txt", pm: "pmset_charging.txt"}), 100, WALL), pipeline.new_state())
+check("charging state", chg.state, "charging")
+check("charging current", chg.current_ma, 2100)
+near("charge time (two-phase model, worked by hand)", chg.charge_h, 1.9334, 0.001)
+check("charging has no runtime", chg.runtime_h, -1)
+check("gauge to full minutes", chg.gauge_to_full_minutes, 88)
+
+let idle = battery.sample(context(make_sh({io: "ioreg_idle_80.txt", pm: "pmset_ac.txt"}), 100, WALL), pipeline.new_state())
+check("zero current is plugged", idle.state, "plugged")
+check("zero current does not divide by zero", idle.runtime_h, -1)
+check("zero power error is zero", idle.power_error_pct, 0)
+check("65535 means unknown (to full)", idle.gauge_to_full_minutes, -1)
+check("65535 means unknown (to empty)", idle.gauge_to_empty_minutes, -1)
+check("pmset with no estimate", idle.macos_minutes, -1)
+check("pmset status text", idle.macos_status, "AC attached")
+
+let none = battery.sample(context(make_sh({io: "ioreg_none.txt", pm: "pmset_none.txt"}), 100, WALL), pipeline.new_state())
+check("no battery", none.present, false)
+
+# ---- the model on synthetic scenarios --------------------------------------------------------
+near("watt hours", model.watt_hours(5000, 11400), 57, 0.0001)
+near("power", model.power_w(-2000, 11000), 22, 0.0001)
+check("runtime", model.runtime_hours(30, 3), 10)
+check("runtime of an idle pack is unknown", model.runtime_hours(30, 0.1), -1)
+check("gauge sentinel", model.gauge_minutes(65535), -1)
+check("gauge zero is a real zero", model.gauge_minutes(0), 0)
+check("gauge value", model.gauge_minutes(705), 705)
+check("nothing needed", model.taper_hours(0, 2000, 100), 0)
+check("already below the end current", model.taper_hours(100, 50, 100), 2)
+check("not charging", model.charge_hours(1000, 4000, 5000, 0), -1)
+check("discharging current", model.charge_hours(1000, 4000, 5000, -300), -1)
+check("already full", model.charge_hours(4000, 4000, 5000, 1000), 0)
+
+# the closed-form taper time against a brute-force integration of the decaying current
+def integrate_taper(charge_needed, i0, i_end) {
+    let tau = charge_needed / (i0 - i_end)
+    let t_end = tau * ln(i0 / i_end)
+    let steps = 20000
+    let dt = t_end / steps
+    let delivered = 0
+    for i = 0 to steps - 1 {
+        delivered = delivered + i0 * pow(E, -(i + 0.5) * dt / tau) * dt
+    }
+    return delivered
+}
+near("taper delivers the charge it was asked for", integrate_taper(784, 2100, 102.06), 784, 0.5)
+near("taper time", model.taper_hours(784, 2100, 102.06), 1.18672, 0.0005)
+
+let knee = 4000 * model.KNEE
+let below = model.charge_hours(knee - 0.001, 4000, 5000, 1500)
+let above = model.charge_hours(knee + 0.001, 4000, 5000, 1500)
+near("the two phases join at the knee", below, above, 0.0005)
+check("a lower start takes longer", model.charge_hours(1000, 4000, 5000, 1500) > model.charge_hours(3000, 4000, 5000, 1500), true)
+check("a bigger current is faster", model.charge_hours(1000, 4000, 5000, 3000) < model.charge_hours(1000, 4000, 5000, 1500), true)
+
+let healthy = model.wear(4900, 5103, 100, 1000)
+near("healthy wear per cycle", healthy.lost_per_cycle_mah, 2.03, 0.0001)
+near("cycles to the service threshold", healthy.cycles_to_service, 402.79, 0.05)
+check("healthy is not below service", healthy.below_service, false)
+let fresh = model.wear(5103, 5103, 0, 1000)
+check("a new pack with zero cycles divides by nothing", fresh.lost_per_cycle_mah, 0)
+check("a new pack has no projection", fresh.cycles_to_service, -1)
+near("projected health at design cycles", model.wear(3920, 5103, 630, 1000).health_at_design_cycles_pct, 63.2, 0.1)
+
+check("state charging", model.state_name(true, true, 2000), "charging")
+check("state plugged", model.state_name(true, false, 0), "plugged")
+check("state discharging", model.state_name(false, false, -171), "discharging")
+check("state idle", model.state_name(false, false, 0), "idle")
+
+let window = []
+for t in [0, 100, 200, 400] {
+    model.push_sample(window, t, 2)
+}
+check("window drops samples older than five minutes", len(window), 3)
+check("window average", model.window_average(window), 2)
+model.push_sample(window, 401, 8)
+near("window average moves (the sample at t=100 has aged out)", model.window_average(window), 4, 0.0001)
+check("empty window", model.window_average([]), 0)
+
+# smoothing through the reader: a burst of draw, then a lower one, averaged
+let sm = pipeline.new_state()
+battery.sample(context(make_sh(discharging()), 100, WALL), sm)
+let later = battery.sample(context(make_sh(discharging()), 160, WALL), sm)
+check("two samples in the window", later.window_samples, 2)
+near("smoothed draw", later.power_w_smoothed, 1.970433, 0.00001)
+let after_unplug = battery.sample(context(make_sh({io: "ioreg_plugged_80.txt", pm: "pmset_ac.txt"}), 200, WALL), sm)
+check("leaving discharge clears the window", after_unplug.window_samples, 0)
+
+let baselines = {design_wh: 58.2, sources: [{source: "test", test: "synthetic", hours: 16.45}]}
+let bm = model.benchmark(baselines, 76.8177, 14.2)
+near("implied draw", bm[0].implied_w, 3.5380, 0.001)
+near("health-adjusted hours", bm[0].health_adjusted_h, 12.636, 0.001)
+
+# ---- one whole tick, and a reader that fails -------------------------------------------------
+let ctx = context(make_sh(discharging()), 100, WALL)
+ctx.baselines = baselines
+let snap = pipeline.collect(ctx, pipeline.new_state())
+check("every module present", len(keys(snap.modules)), 6)
+check("every module ok", snap.modules.cpu.ok and snap.modules.ram.ok and snap.modules.disk.ok and snap.modules.net.ok and snap.modules.battery.ok and snap.modules.clock.ok, true)
+check("benchmark rows", len(snap.benchmark), 1)
+check("snapshot is JSON", len(json.loads(json.dumps(snap)).modules), 6)
+
+let row = pipeline.compare_row(snap)
+check("compare row has one cell per header column", len(split(row, ",")), len(split(pipeline.compare_header(), ",")))
+check("compare row difference column", split(row, ",")[8], kit.fixed(snap.modules.battery.runtime_smoothed_h * 60 - 705, 1))
+check("compare row leaves unknown cells empty", split(row, ",")[9], "")
+
+let broken_log = []
+def log_broken(message) {
+    append(broken_log, message)
+}
+let broken_ctx = context(make_sh({io: "ioreg_discharging_65.txt", pm: "pmset_discharging.txt", fail: "ioreg"}), 100, WALL)
+broken_ctx.log = log_broken
+let broken = pipeline.collect(broken_ctx, pipeline.new_state())
+check("a failing reader is marked not ok", broken.modules.battery.ok, false)
+check("the failure text is kept", "simulated failure of ioreg" in broken.modules.battery.error, true)
+check("the other modules still ran", broken.modules.cpu.ok and broken.modules.ram.ok and broken.modules.net.ok, true)
+check("the failure was logged", len(broken_log), 1)
+check("no battery: the loop runs", pipeline.collect(context(make_sh({io: "ioreg_none.txt", pm: "pmset_none.txt"}), 100, WALL), pipeline.new_state()).modules.battery.present, false)
+check("no battery: no compare row", pipeline.compare_row(pipeline.collect(context(make_sh({io: "ioreg_none.txt", pm: "pmset_none.txt"}), 100, WALL), pipeline.new_state())), "")
+
+# ---- rendering -------------------------------------------------------------------------------
+# The clock row depends on the machine's time zone, so the goldens use a fixed one.
+let fixed_clock = {ok: true, time: "00:00:00", date: "2026-01-01", utc_offset_hours: 0, world: [{name: "UTC", offset: 0, time: "00:00"}]}
+let golden_snap = pipeline.collect(ctx, pipeline.new_state())
+golden_snap.modules.clock = fixed_clock
+let plain = term.render(golden_snap, {esc: "", color: false})
+let plain_text = join(plain, "\n") + "\n"
+if "--update" in args() {
+    write("tests/golden/term_discharging.txt", plain_text)
+    print("golden written")
+}
+check("terminal view matches the golden", plain_text, read("tests/golden/term_discharging.txt"))
+check("plain frame has no escape codes", "[K" in term.frame(golden_snap, {esc: "", color: false}), false)
+let framed = term.frame(golden_snap, {esc: "<E>", color: true})
+check("frame starts with cursor home", framed[:5], "<E>[H")
+check("frame ends with clear below", framed[-5:], "<E>[J")
+check("every line is cleared to its end", len(split(framed, "<E>[K")), len(plain) + 1)
+check("colour is applied", "<E>[32m" in framed, true)
+
+let failed_view = term.render(broken, {esc: "", color: false})
+check("a failed module shows as unavailable", "  unavailable: simulated failure of ioreg" in failed_view, true)
+check("a missing battery shows as none", "  none" in term.render(pipeline.collect(context(make_sh({io: "ioreg_none.txt", pm: "pmset_none.txt"}), 100, WALL), pipeline.new_state()), {esc: "", color: false}), true)
+
+let evil = pipeline.collect(ctx, pipeline.new_state())
+evil.modules.cpu.top[0].name = "A&B <script>"
+let page = html.render(evil, 2)
+check("html is a document", page[:15], "<!doctype html>")
+check("html refreshes", "content=\"2\"" in page, true)
+check("html escapes names", "A&amp;B &lt;script&gt;" in page, true)
+check("html has no raw markup from data", "<script>" in page, false)
+check("html shows the benchmark", "implied" in page, true)
+
+print("")
+print(str(tally.passed) + " passed, " + str(tally.failed) + " failed")
+if tally.failed > 0 {
+    exit(1)
+}

@@ -1,0 +1,10 @@
+{
+  "note": "Static review figures, recorded by hand. Nothing here is fetched at run time and nothing is uploaded anywhere. The figures were gathered from web searches in an earlier session and are quoted as published; re-check them against the sources before relying on them.",
+  "model": "MacBookPro17,1 (13-inch, M1, 2020)",
+  "design_wh": 58.2,
+  "sources": [
+    {"source": "Tom's Guide review", "test": "continuous web surfing over Wi-Fi at 150 nits", "hours": 16.45, "range": "16h25m to 16h32m"},
+    {"source": "Notebookcheck review", "test": "Wi-Fi test; published as 'more than 20 hours' so this is a lower bound", "hours": 20.0},
+    {"source": "Apple specification", "test": "wireless web, manufacturer's test conditions", "hours": 17.0}
+  ]
+}

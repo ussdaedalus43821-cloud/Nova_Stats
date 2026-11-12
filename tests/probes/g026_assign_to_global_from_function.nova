@@ -1,0 +1,5 @@
+let n = 0
+def bump() { n = n + 1 }
+bump()
+bump()
+print(n)
