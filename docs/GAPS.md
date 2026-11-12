@@ -15,13 +15,14 @@ NovaLang, at a cost) - LIMIT (outside what a scripting language can reach).
 
 ## The host boundary, in full
 
-`host.py` is 46 lines. What it supplies, and the gap that made it necessary:
+`host.py` is 53 lines. What it supplies, and the gap that made it necessary:
 
 | Host does | Because |
 | --- | --- |
 | `sh(argv)`, allowlisted, no shell, 5 s limit | NovaLang has no process or system API at all (by design) |
 | `ESC` constant | G-004 / G-005 |
 | `novalang.SCRIPT_ARGS = [...]` before the program starts | G-015 |
+| catches Ctrl-C, prints "Stopping Nova_Stats..." and exits 130 | G-026 |
 | `os.chdir` to the project root | file paths are relative to the working directory (a convenience, not a gap) |
 
 Nothing else: no parsing, no arithmetic, no state, no rendering, no file I/O is done in Python.
@@ -153,6 +154,18 @@ CoreWLAN, SMC, IOReport and a network client are all outside `ps`/`top`/`ioreg`/
 
 ## G-025 Surprise: unspecified Python exceptions - minor
 A host exception shows up in NovaLang as `PythonError: PermissionError: command not allowed: ['/bin/ls']` - catchable, and good enough, but the type name of the *Python* exception is part of the NovaLang message.
+
+## G-026 A NovaLang program cannot handle Ctrl-C, and the embedding API does not either - FRICTION
+- **Tried:** pressing Ctrl-C during the live view printed a Python traceback (`KeyboardInterrupt` out of
+  `subprocess.run`, inside the host's `sh`). A probe with `try { sleep(5000) } catch e { ... }` and a real SIGINT: the
+  `catch` did not run and nothing after the block ran, so NovaLang code cannot intercept an interrupt or clean up.
+  The command line (`novalang.py script.nova`) prints `(stopped)` and exits 130, but `Nova().load_file()`, which
+  `host.py` uses, lets `KeyboardInterrupt` escape to the embedder.
+- **Workaround (host):** `host.py` catches `KeyboardInterrupt` around `load_file`, prints `Stopping Nova_Stats...` to stderr
+  and exits 130. Tests: `tests/test_host.py` (`Interrupt`, including a real SIGINT during the first live frame).
+- **Suggested fix:** have the embedding API stop a run the way the CLI does (or raise a dedicated, catchable
+  error), and document it in the host chapter.
+- **Probe:** none yet: a probe needs a signal, so it would live in `tests/probes/host_probes.py`.
 
 ---
 

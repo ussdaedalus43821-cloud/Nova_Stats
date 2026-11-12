@@ -1,6 +1,6 @@
 """Tests for host.py (the only Python) and a live smoke test on this machine.
 Run: python3 -m unittest tests.test_host   (from the project root)"""
-import contextlib, io, json, os, subprocess, sys, tempfile, unittest
+import contextlib, io, json, os, signal, subprocess, sys, tempfile, unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -82,6 +82,37 @@ class LiveSmoke(unittest.TestCase):
         self.assertIn("\x1b[H", done.stdout)
         self.assertIn("\x1b[K", done.stdout)
         self.assertTrue(done.stdout.rstrip().endswith("\x1b[J"))
+
+
+class Interrupt(unittest.TestCase):
+    """Ctrl-C is how the live view ends: a message and exit code 130, never a traceback."""
+
+    def test_an_interrupt_inside_the_program_ends_quietly(self):
+        err = io.StringIO()
+        original = Nova.load_file
+        Nova.load_file = lambda self, path: (_ for _ in ()).throw(KeyboardInterrupt())
+        try:
+            with contextlib.redirect_stderr(err):
+                code = host.main(["--once"])
+        finally:
+            Nova.load_file = original
+        self.assertEqual(code, 130)
+        self.assertIn("Stopping Nova_Stats", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
+    def test_a_real_sigint_during_the_live_view(self):
+        proc = subprocess.Popen([sys.executable, "-u", os.path.join(ROOT, "host.py"), "--interval", "1"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            proc.stdout.read(1)                      # the first frame has started
+            proc.send_signal(signal.SIGINT)
+            _, err = proc.communicate(timeout=20)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        self.assertEqual(proc.returncode, 130, err)
+        self.assertIn("Stopping Nova_Stats", err)
+        self.assertNotIn("Traceback", err)
 
 
 if __name__ == "__main__":

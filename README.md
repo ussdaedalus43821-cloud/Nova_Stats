@@ -20,7 +20,7 @@ Each tick writes `out/snapshot.json`, `out/dashboard.html`, `out/battery_compare
 
 ## How it is built
 
-"Approach A": NovaLang does everything. `host.py` (46 lines) gives the program exactly two things: `sh(argv)` and `ESC`.
+"Approach A": NovaLang does everything. `host.py` (53 lines) gives the program exactly two things: `sh(argv)` and `ESC`.
 
 - `sh` runs one allowlisted, read-only command (`ps`, `df`, `top`, `vm_stat`, `pmset`, `ioreg`, `netstat`, `sysctl`),
   as an argv list with no shell and a 5 s limit. Anything else raises `PermissionError`.

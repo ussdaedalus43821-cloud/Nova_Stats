@@ -39,8 +39,15 @@ def main(arguments):
     nova = Nova()
     nova.expose_global("sh", sh)
     nova.expose_global("ESC", ESC)
-    nova.load_file(os.path.join(HERE, "src", "main.nova"))
+    try:
+        nova.load_file(os.path.join(HERE, "src", "main.nova"))
+    except KeyboardInterrupt:
+        # Ctrl-C is how the live view is meant to end: say so and use the shell's code for SIGINT.
+        # The interrupt lands inside whichever call is running (usually the 1 s `top` sample).
+        print("\nStopping Nova_Stats...", file=sys.stderr)
+        return 130
+    return 0
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    sys.exit(main(sys.argv[1:]))

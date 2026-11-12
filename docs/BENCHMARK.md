@@ -53,14 +53,51 @@ session) shows that **macOS disagrees with itself**:
 - Nothing in the fields explains it directly. There is no screen-brightness or idle-state field in `ioreg
   AppleSmartBattery` or `pmset -g batt`; the only power fields are `BatteryPower`, `Amperage`, `InstantAmperage`
   and the `PowerTelemetryData` accumulators.
-- **To settle it:** sample on battery for 10-15 minutes (the model's 300 s window against both macOS numbers every
-  tick) and see whether `pmset` tracks the model's smoothed draw or sits below it by a constant amount. The Mac was
-  on AC for this work, so this has not been run.
+- **To settle it:** sample on battery and see whether `pmset` tracks the draw or sits away from it by a constant
+  amount. A first, short run on battery is recorded below ("Measured on battery"); a 10-15 minute run is still open.
 
 The two disagree by about 21 %. macOS smooths over a longer, load-weighted history; the model's instantaneous figure
 used one idle-ish sample. With a 300 s window (`WINDOW_SECONDS`) the model converges toward macOS as samples
 accumulate; one fixture is one sample, so the table shows the worst case. This is a finding about the method, not
 proof that either number is right.
+
+### Measured on battery (2026-11-12, live, not a fixture)
+
+A later session ran on battery, so the question could be tested instead of argued. Two things were seen.
+
+**1. The two macOS numbers are different quantities, and `pmset` is the pessimistic one.** In a live run the dashboard
+showed a smoothed runtime of 5:57 against macOS's 3:32 (a reading from the dashboard, not reproduced below). A
+read-only sampler (`ioreg` and `pmset -g batt` every 15 s for two minutes, about 2830 mAh left, ~11.7 V) shows why:
+
+| t | Current | Draw | `ioreg` AvgTimeToEmpty | remaining / current | `pmset` | draw `pmset` implies |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0-30 s | -901 mA | 10.35 W | 275 min | 188 min | 242 min | 8.05 W |
+| 45-90 s | -386 mA | 4.51 W | 424 min | 441 min | 252 min | 7.89 W |
+| 105-120 s | -485 mA | 5.64 W | 333 min | 349 min | 262 min | 7.53 W |
+
+- `ioreg` `AvgTimeToEmpty` follows the current: it moved 275 -> 424 -> 333 min as the draw fell and rose, and it
+  sits close to remaining capacity / present current (and so to the model's instantaneous figure). It is a short
+  average, and it lags the current a little (275 against 188 min after the jump up to 901 mA).
+- `pmset` barely reacted: 242 -> 252 -> 262 min, a steady climb of about 10 min per gauge update while the current
+  swung between 386 and 901 mA. The draw it implies (8.05 -> 7.53 W) stayed above the draw actually measured in the
+  same two minutes (about 6.7 W on average) and fell slowly towards it.
+- The gauge only updates about every 45 s: three samples in a row were identical each time.
+
+**2. What that says about the cause.** A reserve of capacity at the bottom (the other explanation from above) would
+make `pmset`'s minutes scale with the current, just shifted down, and they did not: a 2.3x change in current moved
+`pmset` by about 4%. A long, load-weighted average of power does fit. The machine had just run a sustained
+CPU+GPU load and a full test suite, and `pmset` was still carrying that history, whereas the model's 300 s window
+(`WINDOW_SECONDS`) and `ioreg`'s average had already moved on. So in this run `pmset` is not wrong, it is answering "how
+long at the load of the last while", and the model answers "how long at about this draw".
+
+**What this does not show.** The sampling lasted two minutes, so the length of `pmset`'s window is unknown (it is
+longer than the model's 300 s, but this cannot say by how much). Which workload history `pmset` holds is inferred from
+what had been running, not read from anywhere. There is no field in `ioreg` or `pmset` that exposes either window.
+One session on one battery (worn: 76-77 % health, 630 cycles). Reproduce with the two commands above, sampled
+while changing the load.
+
+**Consequence for the dashboard:** showing the macOS figure next to the model's, labelled by what each one assumes,
+is more honest than treating the gap as an error in either; the dashboard already prints both.
 
 ## Against the published figures (through implied power)
 
