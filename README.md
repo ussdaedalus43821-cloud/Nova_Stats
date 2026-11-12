@@ -1,6 +1,6 @@
 # Nova_Stats
 
-> **A proof of concept for [NovaLang](https://github.com/ussdaedalus43821-cloud/Nova_Lang), and its first external "Nova Pack" app.**
+> **The first official proof of concept for [NovaLang](https://github.com/ussdaedalus43821-cloud/Nova_Lang), and its first external "Nova Pack" app.**
 > It is not a replacement for Stats. It exists to find out where NovaLang struggles when it does a real job.
 
 A terminal and HTML system dashboard (CPU, RAM, Disk, Net, Battery, Clock) that re-implements the logic of
