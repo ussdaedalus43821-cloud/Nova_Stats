@@ -32,6 +32,31 @@ Health is under the 80 % service threshold the model projects against.
 | macOS (`pmset`, 705 min) | 2.386 W implied | 11:45 | 18:56 |
 | NovaLang, instantaneous (171 mA x 11.523 V) | 1.970 W | **14:14** | 22:55 |
 
+### Why do they disagree? (investigation)
+
+The raw capture that the discharging fixture was built from (this Mac, on battery at 65 %, taken in the first
+session) shows that **macOS disagrees with itself**:
+
+| Source, same instant | Minutes | Implied draw |
+| --- | --- | --- |
+| `ioreg` `AvgTimeToEmpty` / `TimeRemaining` | 798 (13:18) | 2.108 W |
+| `pmset -g batt` | 705 (11:45) | 2.386 W |
+| Model: `BatteryPower` -1970 mW, instantaneous | 854 (14:14) | 1.970 W |
+
+- The fixture's `TimeRemaining` was set to 705 so that it matches `pmset`; the real `ioreg` value was 798. The
+  21 % gap above is therefore the model against *`pmset`*; against the real `ioreg` figure it is 7 %.
+- The instantaneous draw is the lowest of the three, so a longer or load-weighted average in macOS's estimate would
+  explain both of its numbers being more pessimistic. That is consistent with the data but **not proven**: one
+  moment cannot separate "macOS averages over a longer, busier history" from "macOS reserves capacity at the
+  bottom". If it is a reserve, `pmset` is using about 284 mAh (7 % of full charge) less than `ioreg`; if it is an
+  average, it implies a draw about 13 % above `ioreg`'s. Both fit one sample.
+- Nothing in the fields explains it directly. There is no screen-brightness or idle-state field in `ioreg
+  AppleSmartBattery` or `pmset -g batt`; the only power fields are `BatteryPower`, `Amperage`, `InstantAmperage`
+  and the `PowerTelemetryData` accumulators.
+- **To settle it:** sample on battery for 10-15 minutes (the model's 300 s window against both macOS numbers every
+  tick) and see whether `pmset` tracks the model's smoothed draw or sits below it by a constant amount. The Mac was
+  on AC for this work, so this has not been run.
+
 The two disagree by about 21 %. macOS smooths over a longer, load-weighted history; the model's instantaneous figure
 used one idle-ish sample. With a 300 s window (`WINDOW_SECONDS`) the model converges toward macOS as samples
 accumulate; one fixture is one sample, so the table shows the worst case. This is a finding about the method, not
