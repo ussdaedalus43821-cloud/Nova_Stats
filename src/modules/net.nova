@@ -23,6 +23,10 @@ export def sample(ctx, state) {
             names = names + [t[0]]
         }
     }
+    # A blank or garbled netstat would otherwise show "0 B" as if it were a real count (docs/CHAOS.md)
+    if len(names) == 0 {
+        throw("netstat printed no interface counters")
+    }
     let down = 0
     let up = 0
     let have_rate = false

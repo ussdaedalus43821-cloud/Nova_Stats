@@ -93,7 +93,12 @@ def battery_lines(style, m) {
         return [paint(style, "1", "Battery"), "  none"]
     }
     let lines = [paint(style, "1", "Battery  " + m.state + "  (" + m.source + ")")]
-    lines = lines + [meter(style, "charge", m.percent, kit.fixed(m.remaining_mah, 0) + " of " + kit.fixed(m.full_mah, 0) + " mAh, macOS says " + str(m.macos_percent) + "%")]
+    # pmset's own percentage is kept for comparison; a blank or missing pmset leaves it at -1 (docs/CHAOS.md)
+    let macos = "macOS says " + str(m.macos_percent) + "%"
+    if m.macos_percent < 0 {
+        macos = "macOS figure unavailable"
+    }
+    lines = lines + [meter(style, "charge", m.percent, kit.fixed(m.remaining_mah, 0) + " of " + kit.fixed(m.full_mah, 0) + " mAh, " + macos)]
     lines = lines + ["  power " + kit.fixed(m.power_w, 2) + " W (gauge " + kit.fixed(m.reported_power_w, 2) + " W, " + kit.fixed(m.power_error_pct, 1) + "% apart)   current " + kit.fixed(m.current_ma, 0) + " mA   " + kit.fixed(m.voltage_v, 2) + " V"]
     if m.state == "discharging" {
         lines = lines + ["  runtime  now " + kit.duration(m.runtime_h) + "   smoothed " + kit.duration(m.runtime_smoothed_h) + "   macOS " + kit.minutes_text(m.macos_minutes)]

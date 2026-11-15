@@ -8,6 +8,7 @@ STEPS = [
     ("NovaLang tests on the bytecode VM", [sys.executable, NOVA, "tests/run_tests.nova"]),
     ("NovaLang tests on the self-hosted interpreter (--bootstrap)", [sys.executable, NOVA, "--bootstrap", "tests/run_tests.nova"]),
     ("host contract + live smoke test", [sys.executable, "-m", "unittest", "tests.test_host", "-v"]),
+    ("chaos: every system command missing or blank, one at a time", [sys.executable, "-m", "unittest", "tests.test_chaos", "-v"]),
 ]
 failed = []
 for title, argv in STEPS:

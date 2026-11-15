@@ -56,3 +56,5 @@ jobs:
         run: python3 novalang/novalang.py tests/run_tests.nova | tee vm.txt && grep -q " 0 failed" vm.txt
       - name: NovaLang tests on the self-hosted engine
         run: python3 novalang/novalang.py --bootstrap tests/run_tests.nova | tee boot.txt && grep -q " 0 failed" boot.txt
+      - name: Chaos test (each system command missing or blank; replayed, so no Mac needed)
+        run: python3 -m unittest tests.test_chaos -v
