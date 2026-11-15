@@ -1,8 +1,12 @@
 # render_term.nova - the terminal view: snapshot in, list of lines out.
-# NovaLang cannot write an escape character (G-004: no \x, \u, \e; \033 is an error, and
-# there is no chr()), so the host hands over ESC and the style carries it:
-#   style = {esc: <ESC>, color: true}      or    {esc: "", color: false}  for plain text.
+# The style carries the escape character:
+#   style = {esc: ESC, color: true}      or    {esc: "", color: false}  for plain text.
+# A string literal still cannot hold one (G-004: no \x, \u, \e; \033 is an error), but since NovaLang 2.3
+# std:text has chr(), so the program makes ESC itself and the host no longer hands it over (G-005).
 import "kit.nova" as kit
+import "std:text" as text
+
+export let ESC = text.chr(27)
 
 def paint(style, code, text) {
     if not style.color {

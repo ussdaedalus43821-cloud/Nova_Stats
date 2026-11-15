@@ -9,8 +9,12 @@ from novalang import Nova
 
 
 class HostContract(unittest.TestCase):
-    def test_esc_is_the_escape_character(self):
-        self.assertEqual(host.ESC, "\x1b")
+    def test_the_host_hands_over_only_sh(self):
+        # ESC is made by the program (std:text.chr(27)) since NovaLang 2.4; the host no longer has it
+        self.assertFalse(hasattr(host, "ESC"))
+        with open(os.path.join(ROOT, "host.py"), encoding="utf-8") as f:
+            exposed = [line.split('"')[1] for line in f if "expose_global(" in line]
+        self.assertEqual(exposed, ["sh"])
 
     def test_an_allowed_command_runs(self):
         self.assertEqual(int(host.sh(["/usr/sbin/sysctl", "-n", "hw.ncpu"])), os.cpu_count())
@@ -75,7 +79,7 @@ class LiveSmoke(unittest.TestCase):
         with open(os.path.join(ROOT, "out", "dashboard.html")) as f:
             self.assertIn("<!doctype html>", f.read())
 
-    def test_color_mode_writes_escape_codes_through_the_host_constant(self):
+    def test_color_mode_writes_escape_codes_the_program_made_itself(self):
         done = subprocess.run([sys.executable, os.path.join(ROOT, "host.py"), "--once"],
                               capture_output=True, text=True, timeout=60)
         self.assertEqual(done.returncode, 0, done.stderr)
