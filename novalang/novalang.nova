@@ -1,5 +1,13 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) 2026 The Nova Project Contributors
+#
+# Licensed under either of
+#   * Apache License, Version 2.0 (LICENSE-APACHE or http://www.apache.org/licenses/LICENSE-2.0)
+#   * MIT license (LICENSE-MIT or http://opensource.org/licenses/MIT)
+# at your option.
+
 # novalang.nova - NovaLang's own Lexer, Parser and Interpreter, written in
-# NovaLang itself. Part of the NovaLang v2.2.0 release.
+# NovaLang itself. Part of the NovaLang v2.4.0 release.
 #
 # This file is a normal .nova program. Loaded and run by the host
 # (novalang.py), it defines a second, self-hosted implementation of the
@@ -1413,7 +1421,7 @@ let CAPABILITY_OF = {
     "input": "stdin",
     "exit": "process", "args": "process", "platform": "process", "cwd": "process",
     "abspath": "process", "realpath": "process",
-    "regex": "regex", "replace_all": "regex"
+    "regex": "regex"
 }
 
 # What this engine's programs may reach. Set once, before the program runs, by
@@ -1568,6 +1576,9 @@ def check_copy_destination(source, destination) {
 def check_builtin_paths(name, call_args) {
     if not SANDBOX["restricted"] {
         return
+    }
+    if len(name) > 13 and name[0:13] == "native:files." {
+        check_path(call_args[0], "read", "FileError")
     }
     if name == "read" or name == "exists" or name == "listdir" {
         check_path(call_args[0], "read", "FileError")
@@ -1819,6 +1830,18 @@ def charge(units) {
             RUN["work"] = 0
             check_time(0)
         }
+    }
+}
+
+# The work of a native (a regex over a large text): the host reports units of it, 128 to a step of the budget,
+# and the clock is read as for any long operation. Only the restricted profile counts.
+def native_work(units) {
+    if SANDBOX["restricted"] {
+        RUN["steps"] = RUN["steps"] + units // 128
+        if RUN["steps"] >= RUN["next_check"] {
+            step_slow()
+        }
+        charge(units)
     }
 }
 
@@ -2094,7 +2117,7 @@ let VARIABLE_ARITY = {
     range: [1, 3, "range() takes 1, 2 or 3 numbers"],
     split: [1, 2, "split() takes a string and an optional separator"],
     round: [1, 2, "round() takes a number and an optional digit count"],
-    sorted: [1, 2, "sorted() takes a list and an optional true or false"],
+    sorted: [1, 3, "sorted() takes a list and an optional true or false"],
     reduce: [2, 3, "reduce() takes a function, a list and an optional starting value"],
     "assert": [1, 2, "assert() takes a condition and an optional message"],
     exit: [0, 1, "exit() takes an optional status code and nothing else"],
@@ -2190,6 +2213,14 @@ def call_builtin(name, call_args, pos) {
 
 def call_builtin_raw(name, call_args, pos) {
     check_builtin_paths(name, call_args)
+    if len(name) > 7 and name[0:7] == "native:" {
+        # a native function of a standard module: one implementation, in the host (bootstrap.py defines native_call)
+        let string_limit = 0
+        if SANDBOX["restricted"] {
+            string_limit = LIMITS["string"]
+        }
+        return native_call(name[7:], call_args, string_limit, native_work)
+    }
     if DET["on"] and name in DET_NAMES {
         return det_builtin(name, call_args)
     }
@@ -2437,7 +2468,7 @@ def call_builtin_raw(name, call_args, pos) {
         return copy(call_args[0], call_args[1])
     }
     if name == "regex" {
-        return regex(call_args[0], call_args[1])
+        return native_call("builtin.regex", call_args, 0, native_work)
     }
     if name == "replace_all" {
         return replace_all(call_args[0], call_args[1], call_args[2])
@@ -2455,6 +2486,12 @@ def call_builtin_raw(name, call_args, pos) {
         return reverse(call_args[0])
     }
     if name == "sorted" {
+        if len(call_args) >= 2 and is_target_function(call_args[1]) {
+            return target_sorted_by(call_args, pos)
+        }
+        if len(call_args) == 3 {
+            raise_error("sorted() takes a list and an optional true or false", pos)
+        }
         if len(call_args) == 1 {
             return sorted(call_args[0])
         }
@@ -2526,6 +2563,102 @@ def target_filter(fn, items, pos) {
         if keep {
             append(out, item)
         }
+    }
+    return out
+}
+
+# sorted(list, key) and sorted(list, key, descending) (2.4.0, [lib.collections]): the key function is called once for each
+# item, in order, through call_target_value; the items are then ordered by their keys with a merge sort that is stable in
+# both directions (equal keys keep their order), as the host's sort is. A boolean key counts as 0 or 1.
+def target_sorted_by(call_args, pos) {
+    let items = call_args[0]
+    if type(items) != "list" {
+        type_error("sorted() needs a list, but got " + type_phrase(items), pos)
+    }
+    let descending = false
+    if len(call_args) == 3 {
+        if type(call_args[2]) != "boolean" {
+            type_error("sorted()'s third argument must be true or false", pos)
+        }
+        descending = call_args[2]
+    }
+    let key_values = []
+    for item in items {
+        append(key_values, call_target_value(call_args[1], [item], pos))
+    }
+    let numbers = 0
+    let texts = 0
+    let ranks = []
+    for k in key_values {
+        let kind = type(k)
+        if kind == "boolean" {
+            numbers = numbers + 1
+            if k {
+                append(ranks, 1)
+            } else {
+                append(ranks, 0)
+            }
+        } else if kind == "number" {
+            if k != k {
+                type_error("sorted()'s key function must return values that can be compared with each other", pos)
+            }
+            numbers = numbers + 1
+            append(ranks, k)
+        } else if kind == "string" {
+            texts = texts + 1
+            append(ranks, k)
+        } else {
+            type_error("sorted()'s key function must return values that can be compared with each other", pos)
+        }
+    }
+    if numbers > 0 and texts > 0 {
+        type_error("sorted()'s key function must return values that can be compared with each other", pos)
+    }
+    let order = []
+    let i = 0
+    while i < len(items) {
+        append(order, i)
+        i = i + 1
+    }
+    let out = []
+    for index in merge_sorted_indexes(order, ranks, descending) {
+        append(out, items[index])
+    }
+    return out
+}
+
+# The indexes in `order`, ordered by ranks[index]: a right-hand index goes first only when its rank strictly precedes, so
+# equal ranks keep their order.
+def merge_sorted_indexes(order, ranks, descending) {
+    if len(order) <= 1 {
+        return order
+    }
+    let middle = floor(len(order) / 2)
+    let left = merge_sorted_indexes(order[0:middle], ranks, descending)
+    let right = merge_sorted_indexes(order[middle:len(order)], ranks, descending)
+    let out = []
+    let a = 0
+    let b = 0
+    while a < len(left) and b < len(right) {
+        let first = ranks[right[b]] < ranks[left[a]]
+        if descending {
+            first = ranks[right[b]] > ranks[left[a]]
+        }
+        if first {
+            append(out, right[b])
+            b = b + 1
+        } else {
+            append(out, left[a])
+            a = a + 1
+        }
+    }
+    while a < len(left) {
+        append(out, left[a])
+        a = a + 1
+    }
+    while b < len(right) {
+        append(out, right[b])
+        b = b + 1
     }
     return out
 }
@@ -3199,6 +3332,39 @@ let MODULE_LOADING = []  # absolute paths currently being loaded
 let FILE_STACK = []      # directories of files currently executing
 let EXPORT_STACK = [{}]  # current module's {name: value} being built
 
+# The standard modules (docs/spec/08-modules.md [mod.std]): `import "std:text"` loads
+# lib/std/text.nova. `dir` is lib/std, set by bootstrap.py before the program runs; the list of
+# modules is lib/std/modules.json, read on first use, so the three engines share one list.
+let STD = {dir: "", loaded: false, registry: {}}
+
+def is_std_import(raw_path) {
+    return len(raw_path) >= 4 and raw_path[0:4] == "std:"
+}
+
+def resolve_std(raw_path, pos) {
+    if not STD["loaded"] {
+        if STD["dir"] == "" {
+            import_error("the standard modules are not available to this engine", pos)
+        }
+        STD["registry"] = json.loads(read(STD["dir"] + "/modules.json"))["modules"]
+        STD["loaded"] = true
+    }
+    let name = raw_path[4:]
+    if not (name in STD["registry"]) {
+        let known = []
+        for k in sorted(keys(STD["registry"])) {
+            append(known, "std:" + k)
+        }
+        import_error("there is no standard module \"" + raw_path + "\" - the standard modules are: " + join(known, ", "), pos)
+    }
+    for capability in STD["registry"][name]["capabilities"] {
+        if not cap_has(capability) {
+            import_error(raw_path + " needs the '" + capability + "' capability, which this run did not grant", pos)
+        }
+    }
+    return STD["dir"] + "/" + name + ".nova"
+}
+
 def current_dir() {
     if len(FILE_STACK) == 0 {
         return ""
@@ -3217,19 +3383,28 @@ def current_exports() {
 let PACKAGE_FIRST = "abcdefghijklmnopqrstuvwxyz0123456789"
 let PACKAGE_REST = PACKAGE_FIRST + "._-"
 
-def is_package_import(raw_path) {
-    if len(raw_path) == 0 or not (raw_path[0:1] in PACKAGE_FIRST) {
+def is_package_part(part) {
+    if len(part) == 0 or not (part[0:1] in PACKAGE_FIRST) {
         return false
     }
-    if len(raw_path) >= 5 and raw_path[len(raw_path) - 5:] == ".nova" {
-        return false
-    }
-    for ch in raw_path {
+    for ch in part {
         if not (ch in PACKAGE_REST) {
             return false
         }
     }
     return true
+}
+
+# "name", or "owner/name" ([pkg.layout]).
+def is_package_import(raw_path) {
+    if len(raw_path) >= 5 and raw_path[len(raw_path) - 5:] == ".nova" {
+        return false
+    }
+    let pieces = split(raw_path, "/")
+    if len(pieces) == 1 {
+        return is_package_part(pieces[0])
+    }
+    return len(pieces) == 2 and is_package_part(pieces[0]) and is_package_part(pieces[1])
 }
 
 # Stop the line if a project's installed packages are not exactly what its
@@ -3311,6 +3486,9 @@ def resolve_package(name, pos) {
 }
 
 def resolve_import(raw_path, pos) {
+    if is_std_import(raw_path) {
+        return resolve_std(raw_path, pos)
+    }
     if SANDBOX["restricted"] and not cap_has("import") {
         import_error("the 'import' capability is not granted", pos)
     }
@@ -3369,10 +3547,14 @@ def basename(path) {
 }
 
 def default_module_name(raw_path, pos) {
+    if is_std_import(raw_path) {
+        return raw_path[4:]
+    }
     if is_package_import(raw_path) {
-        # "math-utils" binds math_utils, like the host.
+        # "math-utils" binds math_utils, like the host; "owner/name" binds the name after the slash.
         let bound = ""
-        for ch in raw_path {
+        let stem = split(raw_path, "/")
+        for ch in stem[len(stem) - 1] {
             if ch == "-" or ch == "." {
                 bound = bound + "_"
             } else {
@@ -3432,6 +3614,129 @@ def module_label(path, pos) {
     return basename(path)
 }
 
+# ---------------------------------------------------------------------------
+# The declared capabilities of an installed package (docs/spec/18-packages.md, decision D9): the same
+# two checks as the host's check_package_file.
+# ---------------------------------------------------------------------------
+
+let PACKAGE_CAPABILITIES = ["files.read", "files.write", "env", "clock", "random", "stdin", "process", "regex", "python", "net"]
+let PACKAGES_GRANTED = {}
+
+# The gated names a syntax tree refers to, as {name: capability}: a variable the program reads or calls.
+# Field names, dictionary keys and the names a function declares are not references.
+def gated_references(tree) {
+    let found = {}
+    let pending = [tree]
+    while len(pending) > 0 {
+        let node = pop(pending)
+        let kind = type(node)
+        if kind == "dict" {
+            if "kind" in node and node["kind"] == "Var" {
+                let name = node["name"]
+                if name == "python" {
+                    found[name] = "python"
+                } else if name in CAPABILITY_OF {
+                    found[name] = CAPABILITY_OF[name]
+                }
+            }
+            for key in keys(node) {
+                let inner = type(node[key])
+                if inner == "dict" or inner == "list" {
+                    append(pending, node[key])
+                }
+            }
+        } else if kind == "list" {
+            for item in node {
+                let inner = type(item)
+                if inner == "dict" or inner == "list" {
+                    append(pending, item)
+                }
+            }
+        }
+    }
+    return found
+}
+
+# [directory, name] of the installed package a file lies in, or [] for any other file.
+def package_of(path) {
+    let sep = "/"
+    if platform() == "Windows" {
+        sep = "\\"
+    }
+    let marker = sep + ".nova_modules" + sep
+    let at = -1
+    let i = 0
+    while i + len(marker) <= len(path) {
+        if path[i:i + len(marker)] == marker {
+            at = i
+        }
+        i = i + 1
+    }
+    if at < 0 {
+        return []
+    }
+    let rest = path[at + len(marker):]
+    let parts = split(rest, sep)
+    let name = parts[0]
+    if not exists(path[:at + len(marker)] + name + "/nova.json") and len(parts) > 1 {
+        name = parts[0] + "/" + parts[1]               # "owner/name": the first folder is the owner
+    }
+    return [path[:at + len(marker)] + name, name]
+}
+
+def package_declared(directory, name, pos) {
+    let manifest = {}
+    try {
+        manifest = json.loads(read(directory + "/nova.json"))
+    } catch problem {
+        import_error("package \"" + name + "\" has an unreadable nova.json: " + str(problem), pos)
+    }
+    let declared = []
+    if type(manifest) == "dict" and "capabilities" in manifest {
+        declared = manifest["capabilities"]
+    }
+    if type(declared) != "list" {
+        import_error("package \"" + name + "\": \"capabilities\" in its nova.json must be a list of names", pos)
+    }
+    for item in declared {
+        if type(item) != "string" {
+            import_error("package \"" + name + "\": \"capabilities\" in its nova.json must be a list of names", pos)
+        }
+        if not (item in PACKAGE_CAPABILITIES) {
+            import_error("package \"" + name + "\": nova.json declares \"" + item + "\", which is not a capability (the capabilities are: " + join(PACKAGE_CAPABILITIES, ", ") + ")", pos)
+        }
+    }
+    return declared
+}
+
+# Run before an installed package's file is: its declared capabilities were granted, and it refers to no
+# gated name that is not declared.
+def check_package_file(installed, path, source, pos) {
+    let directory = installed[0]
+    let name = installed[1]
+    let declared = package_declared(directory, name, pos)
+    if not (directory in PACKAGES_GRANTED) {
+        for capability in declared {
+            if capability == "net" or not cap_has(capability) {
+                import_error("package \"" + name + "\" needs the '" + capability + "' capability, which this run did not grant", pos)
+            }
+        }
+        PACKAGES_GRANTED[directory] = true
+    }
+    let used = gated_references(parse_program(source))
+    let names = sorted(keys(used))
+    for used_name in names {
+        if not (used[used_name] in declared) {
+            let sep = "/"
+            if platform() == "Windows" {
+                sep = "\\"
+            }
+            let shown = replace_all(path[len(directory) + 1:], sep, "/")
+            import_error("package \"" + name + "\": " + shown + " uses " + used_name + ", which needs the " + used[used_name] + " capability, and its nova.json does not declare it", pos)
+        }
+    }
+}
+
 def run_module(resolved_path, raw_path, pos) {
     if resolved_path in MODULE_CACHE {
         return MODULE_CACHE[resolved_path]
@@ -3456,6 +3761,11 @@ def run_module(resolved_path, raw_path, pos) {
 
     let source = read(resolved_path)
 
+    let installed = package_of(resolved_path)
+    if len(installed) > 0 {
+        check_package_file(installed, resolved_path, source, pos)
+    }
+
     append(MODULE_LOADING, resolved_path)
     append(FILE_STACK, dirname(resolved_path))
     append(EXPORT_STACK, {})
@@ -3466,6 +3776,17 @@ def run_module(resolved_path, raw_path, pos) {
             let ast = parse_program(source)
             let module_env = make_env(false, true, true)
             define_stdlib_globals(module_env)
+            if is_std_import(raw_path) {
+                # a standard module's own natives, in its scope and no other ([mod.std] 6)
+                let std_name = raw_path[4:]
+                if "native" in STD["registry"][std_name] {
+                    let table = {}
+                    for fname in STD["registry"][std_name]["native"] {
+                        table[fname] = {kind: "builtin", name: "native:" + std_name + "." + fname}
+                    }
+                    module_env["vars"]["native"] = table
+                }
+            }
             check_toplevel(exec_block(ast["statements"], module_env))
             exports = current_exports()
         } catch inner {

@@ -20,7 +20,6 @@ NovaLang, at a cost) - LIMIT (outside what a scripting language can reach).
 | Host does | Because |
 | --- | --- |
 | `sh(argv)`, allowlisted, no shell, 5 s limit | NovaLang has no process or system API at all (by design) |
-| `ESC` constant | G-004 / G-005 |
 | `novalang.SCRIPT_ARGS = [...]` before the program starts | G-015 |
 | catches Ctrl-C, prints "Stopping Nova_Stats..." and exits 130 | G-026 |
 | `os.chdir` to the project root | file paths are relative to the working directory (a convenience, not a gap) |
@@ -47,13 +46,13 @@ Nothing else: no parsing, no arithmetic, no state, no rendering, no file I/O is 
 ## G-004 No way to write an escape character - BLOCKER (host)
 - **Tried:** `"\x1b"` -> `unknown escape '\x'`; `"\u001b"` -> `'\u'`; `"\e"` -> `'\e'`; `"\033"` -> `unknown escape '\03'`.
 - **History:** `"\033"` used to be a silent trap: `\0` is the null character, so it lexed as NUL followed by the text `33`, and a terminal showed `33[31m` with no error. Fixed at the start of this project (Python lexer, self-hosted lexer, spec `[lex.escapes]`, 4 conformance cases, and the policy dialect). It is now an error, but still not an escape.
-- **Workaround (host):** `ESC` is handed over as a global string. The renderer takes it as `style.esc`; `style.color = false` disables it.
-- **Consequence:** the self-hosted interpreter has no host to hand it `ESC`, so colour and in-place redraw cannot run there at all (see G-020). The tests render plain text.
+- **Resolved (NovaLang 2.4, library route):** `std:text.chr(27)` builds the escape character in NovaLang. `render_term.nova` exports `ESC = text.chr(27)`; the host no longer supplies it. The literal escapes above are still errors (the probes still pass), so the fix is the standard library, not the lexer.
+- **Consequence (now gone):** the colour frame renders byte for byte the same on the VM and on `--bootstrap` with no host at all (`tests/run_tests.nova`, golden `term_discharging_color.txt`, captured from the old host-supplied `ESC`).
 - **Probes:** `g004_hex_escape`, `g004_unicode_escape`, `g004_e_escape`, `g004_octal_escape`.
 
 ## G-005 No `chr()` / `ord()` - BLOCKER (host)
 - **Tried:** `chr(27)` -> `undefined name 'chr'`. This closes the other way to build ESC.
-- **Workaround (host):** same `ESC` constant. **Probe:** `g005_no_chr.nova`.
+- **Resolved (NovaLang 2.4):** `std:text` has `chr` and `ord`. The bare builtin is still undefined, which is what the probe pins. **Probe:** `g005_no_chr.nova`.
 
 ## G-006 No `find`, `index_of`, `startswith` or `endswith` - FRICTION
 - **Tried:** `find("abc","b")`, `startswith("abc","a")` -> `undefined name`. `in` answers "is it there" but not "where".
@@ -102,7 +101,7 @@ Stats reads per-second read/write rates from IOKit. The only source reachable th
 CoreWLAN, SMC, IOReport and a network client are all outside `ps`/`top`/`ioreg`/`netstat`. Not attempted; the allowlist deliberately has no `curl`, so nothing leaves the machine.
 
 ## G-014 Time zones - LIMIT
-`format_time` knows only the machine's zone, and there is no zone database. `clock.nova` derives the local UTC offset by comparing `format_time` with UTC arithmetic on the epoch, and the world clocks are fixed offsets with no daylight-saving rules (New York is wrong for half the year).
+`format_time` knows only the machine's zone, and there is no zone database. Since NovaLang 2.4 `clock.nova` uses `std:date`: the world clocks are `date.format(date.from_epoch(t, "+HH:MM"), "%H:%M")`, and the local UTC offset is `date.diff_seconds` between the local wall time read back as UTC and the epoch. The hand-written arithmetic it replaces was wrong within an hour of a daylight-saving change (London on 2024-03-31 02:00 BST gave 00:00 UTC; New York 2025-03-09 01:00 EST gave 07:00) and for zones beyond +12 h (Chatham, +13:45, came out as -10:15). Those are fixed; the world clocks are still fixed offsets with no daylight-saving rules (New York is wrong for half the year).
 
 ## G-015 The embedding API cannot give a program its `args()` - FRICTION (host)
 - **Tried:** `Nova().load_file(path)` then `args()` -> `[]` always. The only thing that reaches `args()` is the module global `novalang.SCRIPT_ARGS`, set by the CLI path and by nothing public.
@@ -129,7 +128,7 @@ CoreWLAN, SMC, IOReport and a network client are all outside `ps`/`top`/`ioreg`/
 
 ## G-020 The self-hosted interpreter: 31x slower, and it cannot run the dashboard - BLOCKER for that engine
 - **Speed:** the same 160-check suite takes 0.63 s on the VM and 19.7 s on `--bootstrap` (31x). One whole tick (parse six readers, model, three renders) is 11 ms on the VM and 649 ms self-hosted (58x).
-- **No host binding:** `--bootstrap src/main.nova` -> `undefined name 'ESC'` (and `sh`): there is nothing to expose them through. The live tool runs on the VM only.
+- **No host binding:** `--bootstrap src/main.nova` -> `undefined name 'sh'`: there is nothing to expose it through (`ESC` is now made in NovaLang). The live tool runs on the VM only.
 - **Workaround (NovaLang):** the readers take their command runner in a `ctx` argument, so the suite hands them a NovaLang `sh` that replays recorded output with `read()`. That is why all six readers, the model, and both renderers run identically on both engines.
 - **Parity result:** 160/160 on both. No behavioural difference was found.
 - **Probe:** `tests/probes/host_probes.py` (G-020 lines).

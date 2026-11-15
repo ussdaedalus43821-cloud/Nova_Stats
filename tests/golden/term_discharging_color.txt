@@ -1,0 +1,39 @@
+[H[1;36mnovalang_stats[0m  2026-01-01T00:00:00+00:00[K
+[K
+[1mCPU  Apple M1  (8 cores, 542 processes)[0m[K
+total   [32m█████░░░░░░░░░░░░░░░░░░░[0m  21.2%  user 14.1%  system 7.1%[K
+  load 3.02  3.51  3.42[K
+     30.1%  WindowServer[K
+     14.0%  WallpaperMacintoshExtension[K
+     12.8%  Claude Helper (Renderer)[K
+     12.5%  claude[K
+      5.5%  Claude[K
+[K
+[1mMemory  8.0 GB  pressure warning[0m[K
+used    [33m██████████████████░░░░░░[0m  75.2%  6.0 GB used, 2.0 GB free[K
+  app 1.9 GB  wired 1.4 GB  compressed 2.7 GB  cache 1.4 GB[K
+  swap 2.4 GB of 3.0 GB[K
+      494.1 MB  Claude Helper (Renderer)[K
+      307.5 MB  claude[K
+      159.2 MB  Claude[K
+      113.4 MB  mediaanalysisd[K
+       88.3 MB  Finder[K
+[K
+[1mDisk  /System/Volumes/Data  (/dev/disk3s5)[0m[K
+used    [33m████████████████░░░░░░░░[0m  66.1%  304.4 GB of 460.4 GB, 156.0 GB free[K
+  read 4123G total   written 349G total[K
+[K
+[1mNetwork  en3, en4, en1, en2, en0[0m[K
+  (first sample, no rate yet)[K
+  total in 26.7 GB   out 26.6 GB[K
+[K
+[1mBattery  discharging  (Battery Power)[0m[K
+charge  [33m███████████████░░░░░░░░░[0m  62.1%  2433 of 3920 mAh, macOS says 65%[K
+  power 1.97 W (gauge 1.97 W, 0.0% apart)   current -171 mA   11.52 V[K
+  runtime  now 14:14   smoothed 14:14   macOS 11:45[K
+  full-charge runtime at this draw 22:55[K
+  health 76.8%   cycles 630 of 1000 (63%)   lost 1.88 mAh/cycle[K
+[K
+[1mClock  2026-01-01 00:00:00[0m[K
+  UTC 00:00[K
+[J

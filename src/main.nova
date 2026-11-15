@@ -1,6 +1,7 @@
 # main.nova - the loop: sample, model, render, sleep.
-# Host contract: `sh(argv)` (an allowlisted command runner) and `ESC` (the escape character).
-# Everything else - parsing, state, the battery model, both renderers, the files - is NovaLang.
+# Host contract: `sh(argv)` (an allowlisted command runner), and nothing else: NovaLang has no way to run a
+# command. Everything else - parsing, state, the battery model, both renderers and their escape codes
+# (std:text.chr), the clock (std:date), the files - is NovaLang.
 #   python3 host.py [--once] [--frames N] [--interval SECONDS] [--plain]
 import "pipeline.nova" as pipeline
 import "render_term.nova" as term
@@ -27,7 +28,7 @@ if once {
 mkdir("out")
 let baselines = json.loads(read("docs/baselines.json"))
 let state = pipeline.new_state()
-let style = {esc: ESC, color: not plain}
+let style = {esc: term.ESC, color: not plain}
 let compare_path = "out/battery_compare.csv"
 
 def log_line(message) {
@@ -36,7 +37,7 @@ def log_line(message) {
 
 let count = 0
 if not plain {
-    print(ESC + "[2J")
+    print(term.ESC + "[2J")
 }
 while true {
     let started = monotonic()

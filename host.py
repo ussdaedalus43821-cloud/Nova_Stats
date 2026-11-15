@@ -1,8 +1,10 @@
-"""The only Python in novalang_stats: it gives the NovaLang program the two things the
-language has no way to make for itself, then gets out of the way.
+"""The only Python in novalang_stats: it gives the NovaLang program the one thing the language
+has no way to do for itself, then gets out of the way.
 
   sh(argv)  run one allowlisted, read-only command (a list, never a shell string); 5 s limit
-  ESC       the terminal escape character (NovaLang has no way to write one: docs/GAPS.md G-004)
+
+(Until NovaLang 2.4 it also handed over ESC, the terminal escape character; the program now makes
+it with std:text.chr(27): docs/GAPS.md G-004, G-005.)
 
 Every other thing this file does is recorded in docs/GAPS.md as a host compensation.
 Usage: python3 host.py [--once] [--frames N] [--interval SECONDS] [--plain]
@@ -17,7 +19,6 @@ from novalang import Nova
 ALLOWED = {"/bin/ps", "/bin/df", "/usr/bin/top", "/usr/bin/vm_stat", "/usr/bin/pmset",
            "/usr/sbin/ioreg", "/usr/sbin/netstat", "/usr/sbin/sysctl"}
 TIMEOUT_SECONDS = 5
-ESC = "\x1b"
 
 
 def sh(argv):
@@ -38,7 +39,6 @@ def main(arguments):
     novalang.SCRIPT_ARGS = list(arguments)   # the embedding API has no way to pass args() (G-015)
     nova = Nova()
     nova.expose_global("sh", sh)
-    nova.expose_global("ESC", ESC)
     try:
         nova.load_file(os.path.join(HERE, "src", "main.nova"))
     except KeyboardInterrupt:

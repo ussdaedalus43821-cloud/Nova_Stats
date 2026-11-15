@@ -1,0 +1,123 @@
+# std:decimal - exact base-10 arithmetic (docs/spec/09-library.md [lib.std-decimal]).
+#
+#   import "std:decimal" as dec
+#   let price = dec.parse("19.99")
+#   let total = dec.mul(price, dec.from_int(3))          # 59.97, exactly
+#   print(dec.to_string(dec.div(total, dec.parse("7"), 2, "half_even")))   # 8.57
+#
+# A decimal is the list [unscaled, scale] and means unscaled / 10^scale: [1999, 2] is 19.99.
+# Both are whole numbers, scale is 0 to 1000. Make decimals with this module's functions and
+# read them with its functions; the layout is not part of the interface. Every function checks
+# its arguments, so a list that is not a decimal is an error and never a wrong answer.
+# There are no operators: `+` on two decimals is the list join of the language.
+#
+# The arithmetic is native (Python integers, written once in novalang.py, [mod.std] 6): the first
+# version of this module was plain NovaLang and cost about 60 microseconds an operation, which made a
+# 10,000-row report four times slower than doing the same sums by hand. Every engine calls the same
+# functions, so they cannot disagree; tests/std/test_decimal.py checks them against Python's
+# `decimal` module. No capability, every profile, deterministic. Closes G-043, G-044 and G-045
+# (with std:math).
+#
+# These wrappers are NovaLang functions on purpose: a wrong number of arguments is then the
+# language's own message for a function, the same on every engine.
+
+export def parse(text) {
+    return native.parse(text)
+}
+
+export def try_parse(text) {
+    return native.try_parse(text)
+}
+
+export def from_int(n) {
+    return native.from_int(n)
+}
+
+# A float as the number its text shows (what str() prints, so 0.1 is 0.1 and not the nearest
+# binary value), rounded to `places` digits after the point by `mode`. Infinity and NaN are errors.
+export def from_float(x, places, mode) {
+    return native.from_float(x, places, mode)
+}
+
+export def is_decimal(a) {
+    return native.is_decimal(a)
+}
+
+export def scale(a) {
+    return native.scale(a)
+}
+
+export def add(a, b) {
+    return native.add(a, b)
+}
+
+export def sub(a, b) {
+    return native.sub(a, b)
+}
+
+export def mul(a, b) {
+    return native.mul(a, b)
+}
+
+# a / b rounded to `places` digits after the point by `mode`. Both are required: there is no
+# default, because a quotient is usually not exact.
+export def div(a, b, places, mode) {
+    return native.div(a, b, places, mode)
+}
+
+# `a` with exactly `places` digits after the point: rounded by `mode` when digits are dropped,
+# padded with zeros when they are added.
+export def quantize(a, places, mode) {
+    return native.quantize(a, places, mode)
+}
+
+export def negate(a) {
+    return native.negate(a)
+}
+
+export def absolute(a) {
+    return native.absolute(a)
+}
+
+# -1, 0 or 1.
+export def sign(a) {
+    return native.sign(a)
+}
+
+# -1, 0 or 1: how a compares with b. 1.5 and 1.50 are equal.
+export def cmp(a, b) {
+    return native.cmp(a, b)
+}
+
+export def eq(a, b) {
+    return native.cmp(a, b) == 0
+}
+
+export def lt(a, b) {
+    return native.cmp(a, b) < 0
+}
+
+export def le(a, b) {
+    return native.cmp(a, b) <= 0
+}
+
+# The text of a decimal: no exponent, every digit after the point kept (1.50 stays 1.50), a
+# minus sign only when the value is below zero.
+export def to_string(a) {
+    return native.to_string(a)
+}
+
+# `a` rounded to a whole number by `mode`.
+export def to_int(a, mode) {
+    return native.to_int(a, mode)
+}
+
+# The nearest float.
+export def to_float(a) {
+    return native.to_float(a)
+}
+
+# The exact sum of a list of decimals (the empty list is 0).
+export def total(items) {
+    return native.total(items)
+}

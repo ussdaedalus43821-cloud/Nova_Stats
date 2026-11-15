@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
-# NovaLang v2.2.0 - a small language built from a hand-written lexer,
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) 2026 The Nova Project Contributors
+#
+# Licensed under either of
+#   * Apache License, Version 2.0 (LICENSE-APACHE or http://www.apache.org/licenses/LICENSE-2.0)
+#   * MIT license (LICENSE-MIT or http://opensource.org/licenses/MIT)
+# at your option.
+
+# NovaLang v2.4.0 - a small language built from a hand-written lexer,
 # recursive-descent parser, bytecode compiler and virtual machine.
 """
-NovaLang v2.2.0 - a bytecode compiler and VM
+NovaLang v2.4.0 - a bytecode compiler and VM
 
 Since 2.0.0 a program runs as bytecode:
 
@@ -80,12 +88,19 @@ Stage 14: an Entity-Component-System library (lib/ecs.nova) and a grid
           dialect (M10) and the opt-in restricted profile: capability
           gating, resource limits, a deterministic mode and a subprocess
           runner (M11). trusted stays the default and is unchanged.
+2.3.0:    the standard library (std: modules, with a native tier), the
+          declared stable surface and its test (M13), a regex engine of
+          our own, packages with declared capabilities and a signed
+          registry, and the compiled-artifact cache (M12).
+2.4.0:    (in development) std:date, std:hash and files.sha256_file for the
+          first product pilots (docs/design/m14-product-pilots-plan.md).
 
 No eval(). No exec(). Everything is still built by hand.
 """
 
 import bisect
 import decimal
+import hashlib
 import importlib
 import json as json_module
 import math
@@ -100,10 +115,10 @@ import subprocess
 import tempfile
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date as calendar_date, datetime, timedelta, timezone
 from types import BuiltinFunctionType, FunctionType, MethodType, ModuleType
 
-__version__ = "2.2.0"
+__version__ = "2.4.0"
 
 # A NovaLang call burns several Python frames, so give CPython some headroom
 # and enforce our own, friendlier limit in the interpreter (MAX_CALL_DEPTH).
@@ -2861,13 +2876,725 @@ def builtin_copy(args, position):
 
 # ---- string utilities -----------------------------------------------------------------
 
-def builtin_regex(args, position):
+# ---- regular expressions (docs/spec/09-library.md [lib.regex]) ---------------------------------
+#
+# The matcher behind `regex()` and `std:regex`. It is written here, in Python, and does not call
+# the `re` module: a pattern is parsed, compiled to a small program and run by a Pike virtual
+# machine (a Thompson NFA run in lock step), so the time is O(instructions x text length) whatever
+# the pattern. `(a+)+$` on a long run of "a" finishes at once; in `re` it never does, and nothing
+# in-process can interrupt a C loop. The work is charged to the run (RegexMeter), so the step budget
+# and the time limit end a run that matches a large text with a large pattern.
+#
+# The dialect is fixed by the specification: literals and escapes; `.`; classes; `\d \w \s \b` and
+# their negations (ASCII only, D-021); `^ $`; groups (capturing, non-capturing, named); `|`; greedy
+# and lazy `* + ? {m} {m,} {m,n}`; the flag `(?i)` at the start. What `re` has beyond that
+# (back-references, look-around, atomic groups, possessive quantifiers, conditionals, comments,
+# other flags) is refused with a named error, not run differently.
+
+REGEX_MAX_PATTERN = 4000        # characters in a pattern
+REGEX_MAX_GROUPS = 1000         # capturing groups
+REGEX_MAX_REPEAT = 1000         # the largest m or n of {m,n}
+REGEX_MAX_PROGRAM = 20000       # instructions after repeats are expanded
+REGEX_MAX_NESTING = 100         # groups inside groups
+REGEX_MAX_COMPILE_WORK = 400000  # nodes visited while compiling: a repeat of an empty group adds no instruction
+REGEX_CACHE_SIZE = 128
+REGEX_HARD_STRING = 16 * 1024 * 1024   # the longest string sub() builds when the run has no string limit
+REGEX_UNIT = 128                # thread-steps that cost one step of the run's budget
+CODE_POINT_MAX = 0x10FFFF
+
+(R_CHAR, R_ANY, R_SET, R_SPLIT, R_JMP, R_SAVE, R_BOL, R_EOL, R_WORDB, R_NWORDB, R_MATCH, R_LOOP) = range(12)
+
+REGEX_WORD_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+REGEX_DIGIT = [(48, 57)]
+REGEX_WORD = [(48, 57), (65, 90), (95, 95), (97, 122)]
+REGEX_SPACE = [(9, 13), (32, 32)]
+REGEX_ESCAPED = frozenset("\\.^$*+?{}[]()|-")
+
+
+class RegexError(Exception):
+    """A pattern or a replacement the dialect does not accept; `str()` is the reason."""
+
+
+def regex_normalize(ranges):
+    out = []
+    for lo, hi in sorted(ranges):
+        if out and lo <= out[-1][1] + 1:
+            if hi > out[-1][1]:
+                out[-1] = (out[-1][0], hi)
+        else:
+            out.append((lo, hi))
+    return out
+
+
+def regex_negate(ranges):
+    out = []
+    previous = 0
+    for lo, hi in regex_normalize(ranges):
+        if lo > previous:
+            out.append((previous, lo - 1))
+        previous = hi + 1
+    if previous <= CODE_POINT_MAX:
+        out.append((previous, CODE_POINT_MAX))
+    return out
+
+
+def regex_fold(ranges):
+    """The ranges with the other case of every ASCII letter in them added ((?i) folds ASCII only)."""
+    extra = []
+    for lo, hi in ranges:
+        if max(lo, 65) <= min(hi, 90):
+            extra.append((max(lo, 65) + 32, min(hi, 90) + 32))
+        if max(lo, 97) <= min(hi, 122):
+            extra.append((max(lo, 97) - 32, min(hi, 122) - 32))
+    return regex_normalize(list(ranges) + extra)
+
+
+class RegexParser:
+    """Pattern text to a tree of tuples. Every refusal is a RegexError with the reason."""
+
+    def __init__(self, pattern):
+        self.p = pattern
+        self.i = 0
+        self.groups = 0
+        self.names = {}                 # name -> group number
+        self.fold = False
+
+    def fail(self, reason):
+        raise RegexError(reason)
+
+    def parse(self):
+        if len(self.p) > REGEX_MAX_PATTERN:
+            self.fail("the pattern is longer than {} characters".format(REGEX_MAX_PATTERN))
+        if self.p.startswith("(?i)"):
+            self.fold = True
+            self.i = 4
+        node = self.alternation(0)
+        if self.i < len(self.p):
+            self.fail("unbalanced parenthesis")
+        return node
+
+    def alternation(self, depth):
+        branches = [self.concatenation(depth)]
+        while self.i < len(self.p) and self.p[self.i] == "|":
+            self.i += 1
+            branches.append(self.concatenation(depth))
+        return branches[0] if len(branches) == 1 else ("alt", branches)
+
+    def concatenation(self, depth):
+        items = []
+        while self.i < len(self.p) and self.p[self.i] not in "|)":
+            items.append(self.quantified(self.atom(depth)))
+        if not items:
+            return ("empty",)
+        return items[0] if len(items) == 1 else ("cat", items)
+
+    # -- quantifiers ---------------------------------------------------------
+
+    def repeat_at(self, i):
+        """(low, high, index after) when a `{m}`, `{m,}` or `{m,n}` starts at `i`; None when it is a plain `{`."""
+        p = self.p
+        j = i + 1
+        k = j
+        while k < len(p) and "0" <= p[k] <= "9":
+            k += 1
+        low_text = p[j:k]
+        if k < len(p) and p[k] == "}" and low_text:
+            return int(low_text), int(low_text), k + 1
+        if k < len(p) and p[k] == ",":
+            m = k + 1
+            while m < len(p) and "0" <= p[m] <= "9":
+                m += 1
+            if m < len(p) and p[m] == "}":
+                high_text = p[k + 1:m]
+                if low_text:
+                    return int(low_text), (int(high_text) if high_text else None), m + 1
+                if high_text:
+                    self.fail("write {{0,{}}} for a repeat of up to {}".format(high_text, high_text))
+        return None
+
+    def quantified(self, atom):
+        if self.i >= len(self.p):
+            return atom
+        c = self.p[self.i]
+        if c == "*":
+            low, high, self.i = 0, None, self.i + 1
+        elif c == "+":
+            low, high, self.i = 1, None, self.i + 1
+        elif c == "?":
+            low, high, self.i = 0, 1, self.i + 1
+        elif c == "{":
+            found = self.repeat_at(self.i)
+            if found is None:
+                return atom
+            low, high, self.i = found
+        else:
+            return atom
+        if atom[0] in ("bol", "eol", "wordb", "nwordb"):
+            self.fail("nothing to repeat")
+        if low > REGEX_MAX_REPEAT or (high is not None and high > REGEX_MAX_REPEAT):
+            self.fail("a repeat count is limited to {}".format(REGEX_MAX_REPEAT))
+        if high is not None and low > high:
+            self.fail("the repeat count {{{},{}}} has its minimum above its maximum".format(low, high))
+        greedy = True
+        if self.i < len(self.p) and self.p[self.i] == "?":
+            greedy = False
+            self.i += 1
+        elif self.i < len(self.p) and self.p[self.i] == "+":
+            self.fail("possessive quantifiers are not supported")
+        if self.i < len(self.p) and (self.p[self.i] in "*+?" or (self.p[self.i] == "{" and self.repeat_at(self.i))):
+            self.fail("multiple repeat")
+        return ("rep", atom, low, high, greedy)
+
+    # -- atoms ---------------------------------------------------------------
+
+    def literal(self, code):
+        if self.fold and (65 <= code <= 90 or 97 <= code <= 122):
+            return ("set", regex_fold([(code, code)]))
+        return ("lit", code)
+
+    def atom(self, depth):
+        p = self.p
+        c = p[self.i]
+        if c == "(":
+            return self.group(depth)
+        if c == "[":
+            return self.char_class()
+        if c == ".":
+            self.i += 1
+            return ("any",)
+        if c == "^":
+            self.i += 1
+            return ("bol",)
+        if c == "$":
+            self.i += 1
+            return ("eol",)
+        if c == "\\":
+            return self.escape()
+        if c in "*+?":
+            self.fail("nothing to repeat")
+        if c == "{" and self.repeat_at(self.i) is not None:
+            self.fail("nothing to repeat")
+        self.i += 1
+        return self.literal(ord(c))
+
+    def group(self, depth):
+        p = self.p
+        if depth >= REGEX_MAX_NESTING:
+            self.fail("groups are nested more than {} deep".format(REGEX_MAX_NESTING))
+        self.i += 1
+        index = None
+        if p.startswith("?", self.i):
+            if p.startswith("?:", self.i):
+                self.i += 2
+            elif p.startswith("?P<", self.i):
+                end = p.find(">", self.i)
+                name = p[self.i + 3:end] if end >= 0 else ""
+                if not name or not (name[0].isalpha() or name[0] == "_") or not name.isascii() \
+                        or not all(ch.isalnum() or ch == "_" for ch in name):
+                    self.fail("a group name is letters, digits and _, and does not start with a digit")
+                if name in self.names:
+                    self.fail("the group name {} is used twice".format(name))
+                self.i = end + 1
+                index = self.new_group()
+                self.names[name] = index
+            elif p.startswith("?P=", self.i) or p.startswith("?P>", self.i):
+                self.fail("back-references are not supported")
+            elif p.startswith("?=", self.i) or p.startswith("?!", self.i):
+                self.fail("look-ahead is not supported")
+            elif p.startswith("?<=", self.i) or p.startswith("?<!", self.i):
+                self.fail("look-behind is not supported")
+            elif p.startswith("?<", self.i):
+                self.fail("a named group is written (?P<name>...)")
+            elif p.startswith("?>", self.i):
+                self.fail("atomic groups are not supported")
+            elif p.startswith("?(", self.i):
+                self.fail("conditional groups are not supported")
+            elif p.startswith("?#", self.i):
+                self.fail("comment groups are not supported")
+            elif p[self.i + 1:self.i + 2].isalpha() or p[self.i + 1:self.i + 2] == "-":
+                self.fail("the flag group (?i) is allowed only at the start of the pattern, and no other flag is supported")
+            else:
+                self.fail("this group syntax is not supported")
+        else:
+            index = self.new_group()
+        node = self.alternation(depth + 1)
+        if self.i >= len(p) or p[self.i] != ")":
+            self.fail("missing ), unterminated group")
+        self.i += 1
+        return ("cat", [node]) if index is None else ("group", index, node)
+
+    def new_group(self):
+        if self.groups >= REGEX_MAX_GROUPS:
+            self.fail("a pattern has at most {} groups".format(REGEX_MAX_GROUPS))
+        self.groups += 1
+        return self.groups
+
+    # -- escapes and classes -------------------------------------------------
+
+    def hex_escape(self, digits, who):
+        text = self.p[self.i:self.i + digits]
+        if len(text) != digits or any(ch not in "0123456789abcdefABCDEF" for ch in text):
+            self.fail("{} needs {} hexadecimal digits".format(who, digits))
+        value = int(text, 16)
+        if value > CODE_POINT_MAX:
+            self.fail("{} is beyond the last code point".format(who))
+        self.i += digits
+        return value
+
+    def escape_value(self, in_class):
+        """After a backslash: ("char", code) or ("set", ranges). The index is on the character after the backslash."""
+        p = self.p
+        if self.i >= len(p):
+            self.fail("a pattern cannot end with a backslash")
+        c = p[self.i]
+        self.i += 1
+        shortcuts = {"d": REGEX_DIGIT, "w": REGEX_WORD, "s": REGEX_SPACE}
+        if c in shortcuts:
+            return "set", list(shortcuts[c])
+        if c in "DWS":
+            return "set", regex_negate(shortcuts[c.lower()])
+        simple = {"n": 10, "r": 13, "t": 9, "f": 12, "v": 11}
+        if c in simple:
+            return "char", simple[c]
+        if c == "x":
+            return "char", self.hex_escape(2, "\\x")
+        if c == "u":
+            return "char", self.hex_escape(4, "\\u")
+        if c == "U":
+            return "char", self.hex_escape(8, "\\U")
+        if c == "b" and in_class:
+            return "char", 8
+        if c in "bB" and not in_class:
+            return ("wordb" if c == "b" else "nwordb"), None
+        if "0" <= c <= "9":
+            self.fail("back-references and octal escapes are not supported (write \\x.. for a character code)")
+        if c.isascii() and c.isalpha():
+            self.fail("unknown escape \\{}".format(c))
+        return "char", ord(c)
+
+    def escape(self):
+        self.i += 1
+        kind, value = self.escape_value(False)
+        if kind == "char":
+            return self.literal(value)
+        if kind == "set":
+            return ("set", value)
+        return (kind,)
+
+    def class_item(self):
+        """One member of a [...] class: ("char", code) or ("set", ranges)."""
+        c = self.p[self.i]
+        self.i += 1
+        if c == "\\":
+            return self.escape_value(True)
+        return "char", ord(c)
+
+    def char_class(self):
+        p = self.p
+        self.i += 1
+        negate = False
+        if self.i < len(p) and p[self.i] == "^":
+            negate = True
+            self.i += 1
+        ranges = []
+        first = True
+        while True:
+            if self.i >= len(p):
+                self.fail("missing ], unterminated character class")
+            if p[self.i] == "]" and not first:
+                self.i += 1
+                break
+            first = False
+            kind, value = self.class_item()
+            if self.i + 1 < len(p) and p[self.i] == "-" and p[self.i + 1] != "]":
+                if kind == "set":
+                    self.fail("a character class shortcut cannot start a range")
+                self.i += 1
+                kind2, value2 = self.class_item()
+                if kind2 == "set" or value2 < value:
+                    self.fail("bad character range")
+                ranges.append((value, value2))
+            elif kind == "char":
+                ranges.append((value, value))
+            else:
+                ranges.extend(value)
+        ranges = regex_normalize(ranges)
+        if self.fold:
+            ranges = regex_fold(ranges)
+        if negate:
+            ranges = regex_negate(ranges)
+        return ("set", ranges)
+
+
+class RegexProgram:
+    """A compiled pattern: parallel lists of op codes and operands, and what the matcher needs to start fast."""
+
+    def __init__(self):
+        self.ops = []
+        self.xs = []
+        self.ys = []
+        self.groups = 0
+        self.names = {}
+        self.work = 0
+        self.prefix = ""
+        self.anchored = False
+
+    def add(self, op, x=None, y=None):
+        if len(self.ops) >= REGEX_MAX_PROGRAM:
+            raise RegexError("the pattern is too large: it expands to more than {} instructions".format(REGEX_MAX_PROGRAM))
+        self.ops.append(op)
+        self.xs.append(x)
+        self.ys.append(y)
+        return len(self.ops) - 1
+
+    def emit(self, node):
+        self.work += 1
+        if self.work > REGEX_MAX_COMPILE_WORK:
+            raise RegexError("the pattern is too large: its repeats expand to more than {} steps".format(REGEX_MAX_COMPILE_WORK))
+        kind = node[0]
+        if kind == "lit":
+            self.add(R_CHAR, chr(node[1]))
+        elif kind == "any":
+            self.add(R_ANY)
+        elif kind == "set":
+            ranges = node[1]
+            table = [False] * 128
+            for lo, hi in ranges:
+                for code in range(lo, min(hi, 127) + 1):
+                    table[code] = True
+            self.add(R_SET, (tuple(table), [lo for lo, _ in ranges], [hi for _, hi in ranges]))
+        elif kind == "bol":
+            self.add(R_BOL)
+        elif kind == "eol":
+            self.add(R_EOL)
+        elif kind == "wordb":
+            self.add(R_WORDB)
+        elif kind == "nwordb":
+            self.add(R_NWORDB)
+        elif kind == "cat":
+            for item in node[1]:
+                self.emit(item)
+        elif kind == "alt":
+            jumps = []
+            branches = node[1]
+            for index, branch in enumerate(branches):
+                if index < len(branches) - 1:
+                    split = self.add(R_SPLIT)
+                    self.xs[split] = len(self.ops)
+                    self.emit(branch)
+                    jumps.append(self.add(R_JMP))
+                    self.ys[split] = len(self.ops)
+                else:
+                    self.emit(branch)
+            for jump in jumps:
+                self.xs[jump] = len(self.ops)
+        elif kind == "group":
+            self.add(R_SAVE, 2 * node[1])
+            self.emit(node[2])
+            self.add(R_SAVE, 2 * node[1] + 1)
+        elif kind == "rep":
+            self.emit_repeat(*node[1:])
+        # "empty" emits nothing
+
+    def emit_repeat(self, body, low, high, greedy):
+        if high is None:
+            copies = low - 1 if low >= 1 else 0
+            for _ in range(copies):
+                self.emit(body)
+            # x* is (?:x+)?. The jump back is R_LOOP, not a plain split: an iteration that matched nothing has
+            # come back to a place already visited, and it must leave the loop for what follows (as in Perl and
+            # Python) with the captures of that empty iteration, instead of ending the thread.
+            first = None
+            if low == 0:
+                first = self.add(R_SPLIT)
+            start = len(self.ops)
+            self.emit(body)
+            again = self.add(R_LOOP)
+            end = len(self.ops)
+            self.xs[again] = (start, end, greedy)
+            if first is not None:
+                self.xs[first], self.ys[first] = (start, end) if greedy else (end, start)
+            return
+        for _ in range(low):
+            self.emit(body)
+        splits = []
+        for _ in range(high - low):
+            splits.append(self.add(R_SPLIT))
+            self.emit(body)
+        end = len(self.ops)
+        for split in splits:
+            inside = split + 1
+            self.xs[split], self.ys[split] = (inside, end) if greedy else (end, inside)
+
+    def finish(self):
+        """The start-up hints: a literal every match begins with, and whether a match must begin at the text's start."""
+        ops, xs = self.ops, self.xs
+        pc = 1                          # past `SAVE 0`
+        letters = []
+        while ops[pc] == R_CHAR:
+            letters.append(xs[pc])
+            pc += 1
+        self.prefix = "".join(letters)
+        self.anchored = ops[1] == R_BOL
+
+
+def regex_parse_error(reason):
+    return RegexError(reason)
+
+
+def regex_compile(pattern):
+    """The RegexProgram of `pattern` (cached: programs are never changed), or a RegexError."""
+    program = REGEX_CACHE.get(pattern)
+    if program is not None:
+        return program
+    try:
+        parser = RegexParser(pattern)
+        tree = parser.parse()
+        program = RegexProgram()
+        program.groups = parser.groups
+        program.names = parser.names
+        program.add(R_SAVE, 0)
+        program.emit(tree)
+        program.add(R_SAVE, 1)
+        program.add(R_MATCH)
+        program.finish()
+    except RecursionError:
+        raise RegexError("the pattern is nested too deeply")
+    if len(REGEX_CACHE) >= REGEX_CACHE_SIZE:
+        REGEX_CACHE.clear()
+    REGEX_CACHE[pattern] = program
+    return program
+
+
+REGEX_CACHE = {}
+
+
+class RegexMeter:
+    """Charges the matcher's work to the run: one step of the budget per REGEX_UNIT thread-steps, and the
+    clock is read through Interpreter.charge as for any long operation ([sbx.limits], time)."""
+
+    def __init__(self, interpreter, position):
+        self.interpreter = interpreter
+        self.position = position
+        self.pending = 0
+
+    def tick(self, units):
+        self.pending += units
+        if self.pending >= REGEX_UNIT:
+            steps, self.pending = divmod(self.pending, REGEX_UNIT)
+            interpreter = self.interpreter
+            for _ in range(steps):
+                interpreter.step(self.position)
+            interpreter.charge(steps * REGEX_UNIT, self.position)
+
+
+def regex_search(program, text, start, meter, no_empty_at_start=False, exists=False):
+    """The captures of the leftmost-first match of `program` in `text` that starts at or after `start`, as a
+    list [start0, end0, start1, end1, ...] (None for a group that did not take part), or None.
+    `no_empty_at_start` refuses an empty match at `start` (how find_all moves on after an empty match);
+    `exists` stops at the first thread that matches (the caller wants no captures)."""
+    ops, xs, ys = program.ops, program.xs, program.ys
+    n = len(text)
+    prefix, anchored = program.prefix, program.anchored
+    if anchored and start > 0:
+        return None
+    seen = [-1] * len(ops)
+    base = (None,) * (2 * program.groups + 2)
+
+    def add(threads, pc, caps, at, mark):
+        stack = [(pc, caps)]
+        while stack:
+            pc, caps = stack.pop()
+            while True:
+                op = ops[pc]
+                if op == R_LOOP:
+                    start, end, greedy = xs[pc]
+                    if seen[start] == mark:
+                        pc = end
+                    elif greedy:
+                        stack.append((end, caps))
+                        pc = start
+                    else:
+                        stack.append((start, caps))
+                        pc = end
+                    continue
+                if seen[pc] == mark:
+                    break
+                seen[pc] = mark
+                if op == R_SPLIT:
+                    stack.append((ys[pc], caps))
+                    pc = xs[pc]
+                elif op == R_JMP:
+                    pc = xs[pc]
+                elif op == R_SAVE:
+                    slot = xs[pc]
+                    caps = caps[:slot] + (at,) + caps[slot + 1:]
+                    pc += 1
+                elif op == R_BOL:
+                    if at != 0:
+                        break
+                    pc += 1
+                elif op == R_EOL:
+                    if at == n or (at == n - 1 and text[at] == "\n"):
+                        pc += 1
+                    else:
+                        break
+                elif op == R_WORDB or op == R_NWORDB:
+                    before = at > 0 and text[at - 1] in REGEX_WORD_CHARS
+                    after = at < n and text[at] in REGEX_WORD_CHARS
+                    if (before != after) == (op == R_WORDB):
+                        pc += 1
+                    else:
+                        break
+                else:
+                    threads.append((pc, caps))
+                    break
+
+    pos = start
+    mark = 0
+    clist = []
+    matched = None
+    while True:
+        if matched is None and (not anchored or pos == 0):
+            if not clist and prefix:
+                found = text.find(prefix, pos)
+                if found < 0:
+                    break
+                if found != pos:
+                    pos = found
+                    mark += 1
+            add(clist, 0, base, pos, mark)
+        if not clist:
+            if matched is not None or anchored or pos >= n:
+                break
+            pos += 1                    # nothing alive: look for a match one place on
+            mark += 1
+            continue
+        meter.tick(len(clist))
+        c = text[pos] if pos < n else None
+        mark += 1
+        following = []
+        for pc, caps in clist:
+            op = ops[pc]
+            if op == R_CHAR:
+                ok = c == xs[pc]
+            elif op == R_ANY:
+                ok = c is not None and c != "\n"
+            elif op == R_SET:
+                ok = False
+                if c is not None:
+                    table, los, his = xs[pc]
+                    code = ord(c)
+                    if code < 128:
+                        ok = table[code]
+                    else:
+                        k = bisect.bisect_right(los, code) - 1
+                        ok = k >= 0 and code <= his[k]
+            else:                       # R_MATCH: the threads behind this one are of lower priority, so they end
+                if no_empty_at_start and pos == start:
+                    continue
+                matched = caps
+                if exists:
+                    return matched
+                break
+            if ok:
+                add(following, pc + 1, caps, pos + 1, mark)
+        pos += 1
+        if pos > n:
+            break
+        clist = following
+    return list(matched) if matched is not None else None
+
+
+def regex_iter(program, text, meter, limit=None, first_start=0):
+    """Every match, left to right, as capture lists: at most `limit` of them (None for all). After an empty
+    match the next one must not be empty at the same place, as in Python 3.7 and later."""
+    pos = first_start
+    must_advance = False
+    count = 0
+    while pos <= len(text) and (limit is None or count < limit):
+        caps = regex_search(program, text, pos, meter, must_advance)
+        if caps is None:
+            return
+        count += 1
+        yield caps
+        must_advance = caps[1] == caps[0]
+        pos = caps[1]
+
+
+def regex_match_value(program, text, caps):
+    """The dictionary a std:regex match is: {start, end, text, groups, named}."""
+    groups = []
+    for index in range(1, program.groups + 1):
+        begin, end = caps[2 * index], caps[2 * index + 1]
+        groups.append(NOTHING if begin is None or end is None else text[begin:end])
+    named = {name: groups[index - 1] for name, index in sorted(program.names.items(), key=lambda item: item[1])}
+    return {"start": caps[0], "end": caps[1], "text": text[caps[0]:caps[1]], "groups": groups, "named": named}
+
+
+def regex_template(program, replacement):
+    """A replacement string as a list of pieces: literal text, or a group number to insert."""
+    pieces = []
+    literal = []
+    i = 0
+    while i < len(replacement):
+        c = replacement[i]
+        if c != "\\":
+            literal.append(c)
+            i += 1
+            continue
+        i += 1
+        if i >= len(replacement):
+            raise RegexError("a replacement cannot end with a backslash")
+        d = replacement[i]
+        if d == "\\":
+            literal.append("\\")
+            i += 1
+            continue
+        if "1" <= d <= "9":
+            index = int(d)
+            i += 1
+        elif d == "g":
+            end = replacement.find(">", i)
+            if i + 1 >= len(replacement) or replacement[i + 1] != "<" or end < 0:
+                raise RegexError("\\g must be written \\g<name> or \\g<number>")
+            name = replacement[i + 2:end]
+            if name.isdigit() and name.isascii():
+                index = int(name)
+            elif name in program.names:
+                index = program.names[name]
+            else:
+                raise RegexError("the replacement names a group that the pattern does not have: {}".format(name))
+            i = end + 1
+        else:
+            raise RegexError("unknown escape \\{} in the replacement (use \\\\ for a backslash)".format(d))
+        if index > program.groups:
+            raise RegexError("the replacement uses group {}, and the pattern has {}".format(index, program.groups))
+        if literal:
+            pieces.append("".join(literal))
+            literal = []
+        pieces.append(index)
+    if literal:
+        pieces.append("".join(literal))
+    return pieces
+
+
+def regex_escape(text):
+    return "".join("\\" + c if c in REGEX_ESCAPED else c for c in text)
+
+
+def regex_meter(interpreter, position):
+    return RegexMeter(interpreter, position)
+
+
+def builtin_regex(args, position, interpreter):
     pattern = text_argument(args[0], "the pattern for regex()", position)
     text = text_argument(args[1], "the text for regex()", position)
     try:
-        return re.search(pattern, text, re.ASCII) is not None   # \d \w \s \b are ASCII (D-021)
-    except re.error as problem:
+        program = regex_compile(pattern)
+    except RegexError as problem:
         raise NovaError("regex(): bad pattern: {}".format(problem), position, label="TypeError")
+    return regex_search(program, text, 0, regex_meter(interpreter, position), exists=True) is not None
 
 
 def builtin_replace_all(args, position):
@@ -2910,22 +3637,39 @@ def builtin_reverse(args, position):
     )
 
 
-def builtin_sorted(args, position):
-    if not 1 <= len(args) <= 2:
+def sorted_comparable(items):
+    """Can these be ordered by sorted() ([lib.collections]): all numbers and booleans (a boolean counts as 0 or 1), or all
+    strings, and no NaN (D-019)."""
+    numbers = [is_number(item) or isinstance(item, bool) for item in items]
+    texts = [isinstance(item, str) for item in items]
+    return (all(numbers) or all(texts)) and not any(isinstance(item, float) and item != item for item in items)
+
+
+def builtin_sorted(args, position, interpreter):
+    # sorted(list), sorted(list, descending), and since 2.4.0 sorted(list, key) and sorted(list, key, descending) (G-038): the key
+    # function is called once for each item, in order, and the items are ordered by what it returns, stably (items whose keys are
+    # equal keep the order they had, in either direction). The messages of the old forms are unchanged (STABLE.md).
+    keyed = len(args) >= 2 and isinstance(args[1], (NovaFunction, BuiltinFunction))
+    if not 1 <= len(args) <= (3 if keyed else 2):
         raise NovaError("sorted() takes a list and an optional true or false", position)
     items = list(list_argument(args[0], "sorted()", position))
     descending = False
+    if keyed:
+        if len(args) > 2:
+            if not isinstance(args[2], bool):
+                raise NovaError("sorted()'s third argument must be true or false", position, label="TypeError")
+            descending = args[2]
+        keys = [interpreter.call_value(args[1], [item], position) for item in items]
+        if not sorted_comparable(keys):
+            raise NovaError("sorted()'s key function must return values that can be compared with each other", position,
+                            label="TypeError")
+        order = sorted(range(len(items)), key=keys.__getitem__, reverse=descending)      # Python's sort is stable both ways
+        return [items[i] for i in order]
     if len(args) > 1:
         if not isinstance(args[1], bool):
             raise NovaError("sorted()'s second argument must be true or false", position, label="TypeError")
         descending = args[1]
-    # Numbers (a boolean counts as 0 or 1) sort among themselves and strings
-    # among themselves; any other item, a NaN, or a mixture, cannot be ordered
-    # (D-019).
-    numbers = [is_number(item) or isinstance(item, bool) for item in items]
-    texts = [isinstance(item, str) for item in items]
-    if not (all(numbers) or all(texts)) or any(
-            isinstance(item, float) and item != item for item in items):
+    if not sorted_comparable(items):
         raise NovaError("sorted() needs items that can be compared with each other", position, label="TypeError")
     items.sort(reverse=descending)
     return items
@@ -3070,13 +3814,13 @@ BUILTINS = {
     "remove": BuiltinFunction("remove", 1, builtin_remove, paths=((0, "write"),)),
     "rename": BuiltinFunction("rename", 2, builtin_rename, paths=((0, "write"), (1, "write"))),
     "copy": BuiltinFunction("copy", 2, builtin_copy, paths=((0, "read"), (1, "write"))),
-    "regex": BuiltinFunction("regex", 2, builtin_regex),
+    "regex": BuiltinFunction("regex", 2, builtin_regex, needs_interpreter=True),
     "replace_all": BuiltinFunction("replace_all", 3, builtin_replace_all),
     "split_lines": BuiltinFunction("split_lines", 1, builtin_split_lines),
     "pad": BuiltinFunction("pad", 2, builtin_pad),
     "pad_left": BuiltinFunction("pad_left", 2, builtin_pad_left),
     "reverse": BuiltinFunction("reverse", 1, builtin_reverse),
-    "sorted": BuiltinFunction("sorted", None, builtin_sorted),
+    "sorted": BuiltinFunction("sorted", None, builtin_sorted, needs_interpreter=True),
     "assert": BuiltinFunction("assert", None, builtin_assert),
     "log": BuiltinFunction("log", None, builtin_log, needs_interpreter=True),
     "map": BuiltinFunction("map", 2, builtin_map, needs_interpreter=True),
@@ -3800,7 +4544,7 @@ for _capability, _names in (
     ("random", ("random", "randint", "choice", "shuffle")),
     ("stdin", ("input",)),
     ("process", ("exit", "args", "platform", "cwd", "abspath", "realpath")),
-    ("regex", ("regex", "replace_all")),
+    ("regex", ("regex",)),   # replace_all left this group in M13 (G-050): a plain substring replacement, already bounded by the string limit
 ):
     for _name in _names:
         CAPABILITY_OF[_name] = _capability
@@ -4102,6 +4846,8 @@ class ProgramExit(Exception):
 
 
 class Interpreter:
+    artifact_cache = None            # an ArtifactCache for a command-line program and its modules ([bc.cache]); None: no cache
+
     def __init__(self, engine=None, allow_python=None, capabilities=None):
         self.engine = engine or DEFAULT_ENGINE
         if self.engine not in ENGINES:
@@ -4139,6 +4885,7 @@ class Interpreter:
         self.file_stack = []
         self.import_stack = []          # resolved paths currently loading
         self.modules = {}               # resolved path -> its exports dict
+        self.packages_granted = set()   # installed packages whose declared capabilities were found granted
         self.type_cache = None          # the type gate's results (a GateCache)
         self.current_exports = {}       # name -> value, for the module now loading
 
@@ -4388,6 +5135,15 @@ class Interpreter:
 
     def import_module(self, raw_path, position):
         """Load (once) the module `raw_path` names; its exports dict."""
+        if is_std_import(raw_path):
+            # Part of the interpreter: no `import` grant and no folder grant is needed, but every
+            # capability the module declares must have been granted ([mod.std]).
+            found, descriptor = resolve_std(raw_path, position)
+            for capability in descriptor["capabilities"]:
+                if not self.caps.has(capability):
+                    raise NovaError("{} needs the '{}' capability, which this run did not grant".format(
+                        raw_path, capability), position, label="ImportError")
+            return self.load_module(found, raw_path, position)
         if self.caps.restricted and not self.caps.has("import"):
             raise NovaError("the 'import' capability is not granted", position, label="ImportError")
         resolved = self.resolve_import(raw_path, position)
@@ -4446,6 +5202,29 @@ class Interpreter:
             position, label="ImportError",
         )
 
+    def check_package_file(self, installed, path, source, position):
+        """The two checks of an installed package's file ([pkg.capabilities]): the capabilities its nova.json
+        declares were granted to this run, and the file refers to no gated name that is not declared."""
+        directory, name = installed
+        declared = package_declared(directory, name, position)
+        if directory not in self.packages_granted:
+            for capability in declared:
+                if capability == "net" or not self.caps.has(capability):
+                    raise NovaError('package "{}" needs the \'{}\' capability, which this run did not grant'.format(
+                        name, capability), position, label="ImportError")
+            self.packages_granted.add(directory)
+        try:
+            tree = Parser(Lexer(source).tokenize()).parse()
+        except NovaError as error:
+            raise NovaError('while loading module "{}":\n{}'.format(module_label(path), indent_lines(error.render(source))),
+                            position, label="ImportError") from None
+        except RecursionError:
+            raise NovaError('package "{}": {} is nested too deeply'.format(name, module_label(path)), position, label="ImportError")
+        for used, capability in sorted(gated_references(tree).items()):
+            if capability not in declared:
+                raise NovaError('package "{}": {} uses {}, which needs the {} capability, and its nova.json does not declare it'.format(
+                    name, os.path.relpath(path, directory).replace(os.sep, "/"), used, capability), position, label="ImportError")
+
     def load_module(self, resolved_path, raw_path, position):
         """Run a file once and cache its exports, keyed by resolved path.
 
@@ -4456,6 +5235,7 @@ class Interpreter:
         if resolved_path in self.modules:
             return self.modules[resolved_path]
 
+        std_name = raw_path[len(STD_PREFIX):] if is_std_import(raw_path) else None
         if resolved_path in self.import_stack:
             cycle = self.import_stack[self.import_stack.index(resolved_path):] + [resolved_path]
             chain = " -> ".join(module_label(path) for path in cycle)
@@ -4474,11 +5254,18 @@ class Interpreter:
                 position, label="ImportError",
             )
 
+        installed = package_of(resolved_path)
+        if installed is not None:
+            self.check_package_file(installed, resolved_path, source, position)
+
         # A module gets its own top-level scope, its own call stack and its
         # own set of exports - it is a fresh program, not a shared block.
         saved = (self.globals, self.env, self.call_stack, self.current_exports)
         self.globals = self.new_global_scope()
         self.env = self.globals
+        if std_name is not None and std_registry()[std_name].get("native"):
+            # the native functions of this one standard module, nothing else ([mod.std] 6)
+            self.globals.define("native", dict(NATIVE_FUNCTIONS[std_name]))
         self.call_stack = []
         self.current_exports = {}
         self.import_stack.append(resolved_path)
@@ -4886,12 +5673,1509 @@ def is_number(value):
 # '/' in it - is a file, resolved exactly as before packages existed.
 # ---------------------------------------------------------------------------
 
-PACKAGE_NAME = re.compile(r"[a-z0-9][a-z0-9._-]*\Z")
+PACKAGE_NAME = re.compile(r"[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)?\Z")   # "name", or "owner/name" ([pkg.layout])
 PACKAGE_DIR = ".nova_modules"
 
 
 def is_package_import(raw_path):
     return bool(PACKAGE_NAME.match(raw_path)) and not raw_path.endswith(".nova")
+
+
+# ---------------------------------------------------------------------------
+# Declared capabilities of an installed package (docs/spec/18-packages.md, decision D9)
+#
+# A package says which capabilities its code uses in the "capabilities" list of its nova.json. The
+# check is static: the syntax tree of each of its files is searched for the gated names ([sbx.capabilities])
+# it can refer to, and a file that refers to a name whose capability is not declared is refused when it
+# is imported; a package whose declared capabilities this run did not grant is refused at the import.
+# NovaLang has no dynamic code and no reflection, so a package cannot reach a gated name it does not
+# write. This is a consent screen and a review aid: it does not stop a program from handing a gated
+# function to a package as an argument, and it is not isolation (the grants of the run remain the only
+# enforcement at run time).
+# ---------------------------------------------------------------------------
+
+PACKAGE_CAPABILITIES = ("files.read", "files.write", "env", "clock", "random", "stdin", "process", "regex", "python", "net")
+
+
+def gated_references(tree):
+    """{name: capability} for every gated name the syntax tree refers to: a variable the program reads or calls.
+    Field names (`x.read`), dictionary keys and names a function declares are not references."""
+    found = {}
+    pending = [tree]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, VarNode):
+            capability = "python" if node.name == "python" else CAPABILITY_OF.get(node.name)
+            if capability is not None:
+                found.setdefault(node.name, capability)
+        elif isinstance(node, Node):
+            pending.extend(vars(node).values())
+        elif isinstance(node, (list, tuple)):
+            pending.extend(node)
+    return found
+
+
+def package_of(path):
+    """(directory, name) of the installed package a file lies in, or None for any other file."""
+    marker = os.sep + PACKAGE_DIR + os.sep
+    if marker not in path:
+        return None
+    before, after = path.rsplit(marker, 1)
+    parts = after.split(os.sep)
+    name = parts[0]
+    if not os.path.isfile(os.path.join(before + marker + name, "nova.json")) and len(parts) > 1:
+        name = parts[0] + "/" + parts[1]                  # "owner/name": the first folder is the owner
+    return before + marker + name.replace("/", os.sep), name
+
+
+def package_declared(directory, name, position):
+    """The capabilities a package's nova.json declares: a list of names from the closed list, or an ImportError."""
+    try:
+        with open(os.path.join(directory, "nova.json"), "r", encoding="utf-8") as handle:
+            manifest = json_module.load(handle)
+    except (OSError, ValueError) as problem:
+        raise NovaError('package "{}" has an unreadable nova.json: {}'.format(name, problem), position, label="ImportError")
+    declared = manifest.get("capabilities", []) if isinstance(manifest, dict) else []
+    if not isinstance(declared, list) or any(not isinstance(item, str) for item in declared):
+        raise NovaError('package "{}": "capabilities" in its nova.json must be a list of names'.format(name),
+                        position, label="ImportError")
+    for item in declared:
+        if item not in PACKAGE_CAPABILITIES:
+            raise NovaError('package "{}": nova.json declares "{}", which is not a capability (the capabilities are: {})'.format(
+                name, item, ", ".join(PACKAGE_CAPABILITIES)), position, label="ImportError")
+    return declared
+
+
+# The standard modules (docs/spec/08-modules.md [mod.std]): `import "std:text"` loads
+# lib/std/text.nova, one of the files listed in lib/std/modules.json. The list is the only way
+# in: the name after `std:` is looked up, never joined to a path.
+STD_PREFIX = "std:"
+STD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "std")
+_std_registry = None
+
+
+def is_std_import(raw_path):
+    return raw_path.startswith(STD_PREFIX)
+
+
+def std_registry():
+    """{name: descriptor} read once from lib/std/modules.json."""
+    global _std_registry
+    if _std_registry is None:
+        with open(os.path.join(STD_DIR, "modules.json"), "r", encoding="utf-8") as handle:
+            _std_registry = json_module.load(handle)["modules"]
+    return _std_registry
+
+
+def resolve_std(raw_path, position):
+    """(file, descriptor) of the standard module `raw_path` names, or an ImportError."""
+    name = raw_path[len(STD_PREFIX):]
+    registry = std_registry()
+    if name not in registry:
+        raise NovaError(
+            'there is no standard module "{}" - the standard modules are: {}'.format(
+                raw_path, ", ".join(STD_PREFIX + known for known in sorted(registry))),
+            position, label="ImportError")
+    return os.path.join(STD_DIR, name + ".nova"), registry[name]
+
+
+# ---------------------------------------------------------------------------
+# Native standard modules (docs/spec/08-modules.md [mod.std], M13 slice 3)
+# ---------------------------------------------------------------------------
+#
+# A standard module written in NovaLang can reach Python-implemented functions through a predefined
+# global `native`, defined in the scope of a standard module that lists `native` names in
+# lib/std/modules.json and in no other scope: no program can name it, and it reserves nothing. The
+# functions are plain (args, position) built-ins kept in NATIVE_FUNCTIONS, not in BUILTINS. The
+# self-hosted interpreter reaches the same functions through `native_call`, which bootstrap.py defines
+# for it alone. One implementation, so the three engines cannot disagree about what these compute.
+
+DECIMAL_MODES = ("half_even", "half_up", "half_down", "up", "down", "floor", "ceiling")
+DECIMAL_MAX_SCALE = 1000
+_ASCII_DIGITS = "0123456789"
+
+
+def native_error(message, position):
+    return NovaError(message, position, label="Error")
+
+
+def decimal_fail(who, what, position):
+    raise native_error("decimal.{}() {}".format(who, what), position)
+
+
+def decimal_whole(x):
+    """The integer a whole number stands for (5, 5.0 and 1e30 all do), or None."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return None
+    if isinstance(x, float):
+        if x != x or x in (float("inf"), float("-inf")) or x != math.floor(x):
+            return None
+        return int(x)
+    return x
+
+
+def decimal_read(who, role, a, position):
+    """(unscaled, scale) of the decimal `a`, or the error that names the argument."""
+    if isinstance(a, list) and len(a) == 2:
+        unscaled, scale = decimal_whole(a[0]), decimal_whole(a[1])
+        if unscaled is not None and scale is not None and 0 <= scale <= DECIMAL_MAX_SCALE:
+            return unscaled, scale
+    decimal_fail(who, "needs a decimal for {}, but got {}".format(role, format_value(a)), position)
+
+
+def decimal_places(who, places, position):
+    value = decimal_whole(places)
+    if value is None or not 0 <= value <= DECIMAL_MAX_SCALE:
+        decimal_fail(who, "needs places to be a whole number from 0 to {}".format(DECIMAL_MAX_SCALE), position)
+    return value
+
+
+def decimal_mode(who, mode, position):
+    if not isinstance(mode, str) or mode not in DECIMAL_MODES:
+        decimal_fail(who, "needs a rounding mode: {}".format(", ".join(DECIMAL_MODES)), position)
+    return mode
+
+
+def decimal_make(unscaled, scale, position):
+    return [bounded_integer(unscaled, position), scale]
+
+
+def decimal_round_div(n, d, mode):
+    """n / d (d > 0) rounded to a whole number by `mode`."""
+    q, r = divmod(n, d)
+    if r == 0:
+        return q
+    negative = n < 0
+    if mode == "floor":
+        return q
+    if mode == "ceiling":
+        return q + 1
+    if mode == "down":
+        return q + 1 if negative else q
+    if mode == "up":
+        return q if negative else q + 1
+    twice = 2 * r
+    if twice < d:
+        return q
+    if twice > d:
+        return q + 1
+    if mode == "half_up":
+        return q if negative else q + 1
+    if mode == "half_down":
+        return q + 1 if negative else q
+    return q if q % 2 == 0 else q + 1
+
+
+def decimal_scan(text, allow_exponent):
+    """(unscaled, scale) for the text of a number (sign, digits, a point, digits, and when allowed an
+    e and a whole exponent), or None. At least one digit and nothing else."""
+    n, i, negative = len(text), 0, False
+    if n and text[0] in "+-":
+        negative = text[0] == "-"
+        i = 1
+    digits, scale, seen_point = [], 0, False
+    while i < n:
+        ch = text[i]
+        if ch in _ASCII_DIGITS:
+            digits.append(ch)
+            if seen_point:
+                scale += 1
+        elif ch == "." and not seen_point:
+            seen_point = True
+        else:
+            break
+        i += 1
+    if not digits or len(digits) > MAX_INTEGER_DIGITS:
+        return None
+    exponent = 0
+    if i < n:
+        if not allow_exponent or text[i] not in "eE":
+            return None
+        i += 1
+        exp_negative = False
+        if i < n and text[i] in "+-":
+            exp_negative = text[i] == "-"
+            i += 1
+        start = i
+        while i < n and text[i] in _ASCII_DIGITS:
+            i += 1
+        exp_digits = text[start:i]
+        if not exp_digits or len(exp_digits) > 4 or i != n:
+            return None
+        exponent = -int(exp_digits) if exp_negative else int(exp_digits)
+    unscaled = int("".join(digits))
+    scale -= exponent
+    if scale < 0:
+        if -scale > 3900:
+            return None
+        unscaled *= 10 ** -scale
+        scale = 0
+    if scale > DECIMAL_MAX_SCALE:
+        return None
+    return (-unscaled if negative else unscaled), scale
+
+
+def decimal_aligned(x, y):
+    """(a, b, scale): the unscaled values of two decimals at the larger of their scales."""
+    scale = max(x[1], y[1])
+    return x[0] * 10 ** (scale - x[1]), y[0] * 10 ** (scale - y[1]), scale
+
+
+def native_decimal_parse(args, position):
+    if not isinstance(args[0], str):
+        decimal_fail("parse", "needs a string, but got {}".format(type_category(args[0])), position)
+    found = decimal_scan(args[0], False)
+    if found is None:
+        decimal_fail("parse", 'cannot read a decimal from "{}"'.format(args[0]), position)
+    return decimal_make(found[0], found[1], position)
+
+
+def native_decimal_try_parse(args, position):
+    if not isinstance(args[0], str):
+        decimal_fail("try_parse", "needs a string, but got {}".format(type_category(args[0])), position)
+    found = decimal_scan(args[0], False)
+    return NOTHING if found is None else decimal_make(found[0], found[1], position)
+
+
+def native_decimal_from_int(args, position):
+    n = decimal_whole(args[0])
+    if n is None:
+        decimal_fail("from_int", "needs a whole number, but got {}".format(format_value(args[0])), position)
+    return decimal_make(n, 0, position)
+
+
+def native_decimal_from_float(args, position):
+    x, places, mode = args
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        decimal_fail("from_float", "needs a number, but got {}".format(type_category(x)), position)
+    p = decimal_places("from_float", places, position)
+    decimal_mode("from_float", mode, position)
+    found = decimal_scan(format_value(x), True)
+    if found is None:
+        decimal_fail("from_float", "cannot read the number {}".format(format_value(x)), position)
+    return native_decimal_quantize([decimal_make(found[0], found[1], position), p, mode], position)
+
+
+def native_decimal_is_decimal(args, position):
+    a = args[0]
+    if not isinstance(a, list) or len(a) != 2:
+        return False
+    unscaled, scale = decimal_whole(a[0]), decimal_whole(a[1])
+    return unscaled is not None and scale is not None and 0 <= scale <= DECIMAL_MAX_SCALE
+
+
+def native_decimal_scale(args, position):
+    return decimal_read("scale", "its argument", args[0], position)[1]
+
+
+def native_decimal_add(args, position):
+    x = decimal_read("add", "the first argument", args[0], position)
+    y = decimal_read("add", "the second argument", args[1], position)
+    a, b, scale = decimal_aligned(x, y)
+    return decimal_make(a + b, scale, position)
+
+
+def native_decimal_sub(args, position):
+    x = decimal_read("sub", "the first argument", args[0], position)
+    y = decimal_read("sub", "the second argument", args[1], position)
+    a, b, scale = decimal_aligned(x, y)
+    return decimal_make(a - b, scale, position)
+
+
+def native_decimal_mul(args, position):
+    x = decimal_read("mul", "the first argument", args[0], position)
+    y = decimal_read("mul", "the second argument", args[1], position)
+    if x[1] + y[1] > DECIMAL_MAX_SCALE:
+        decimal_fail("mul", "result would have more than {} digits after the point".format(DECIMAL_MAX_SCALE), position)
+    return decimal_make(x[0] * y[0], x[1] + y[1], position)
+
+
+def native_decimal_div(args, position):
+    a, b, places, mode = args
+    x = decimal_read("div", "the dividend", a, position)
+    y = decimal_read("div", "the divisor", b, position)
+    p = decimal_places("div", places, position)
+    decimal_mode("div", mode, position)
+    if y[0] == 0:
+        decimal_fail("div", "cannot divide by zero", position)
+    top = bounded_integer(x[0] * 10 ** (y[1] + p), position)
+    bottom = y[0] * 10 ** x[1]
+    if bottom < 0:
+        top, bottom = -top, -bottom
+    return decimal_make(decimal_round_div(top, bottom, mode), p, position)
+
+
+def native_decimal_quantize(args, position):
+    a, places, mode = args
+    x = decimal_read("quantize", "its first argument", a, position)
+    p = decimal_places("quantize", places, position)
+    decimal_mode("quantize", mode, position)
+    if p >= x[1]:
+        return decimal_make(x[0] * 10 ** (p - x[1]), p, position)
+    return decimal_make(decimal_round_div(x[0], 10 ** (x[1] - p), mode), p, position)
+
+
+def native_decimal_negate(args, position):
+    x = decimal_read("negate", "its argument", args[0], position)
+    return decimal_make(-x[0], x[1], position)
+
+
+def native_decimal_absolute(args, position):
+    x = decimal_read("absolute", "its argument", args[0], position)
+    return decimal_make(abs(x[0]), x[1], position)
+
+
+def native_decimal_sign(args, position):
+    x = decimal_read("sign", "its argument", args[0], position)
+    return (x[0] > 0) - (x[0] < 0)
+
+
+def native_decimal_cmp(args, position):
+    x = decimal_read("cmp", "the first argument", args[0], position)
+    y = decimal_read("cmp", "the second argument", args[1], position)
+    a, b, _ = decimal_aligned(x, y)
+    return (a > b) - (a < b)
+
+
+def decimal_text(unscaled, scale):
+    sign = "-" if unscaled < 0 else ""
+    digits = str(abs(unscaled))
+    if scale == 0:
+        return sign + digits
+    digits = digits.rjust(scale + 1, "0")
+    return "{}{}.{}".format(sign, digits[:len(digits) - scale], digits[len(digits) - scale:])
+
+
+def native_decimal_to_string(args, position):
+    x = decimal_read("to_string", "its argument", args[0], position)
+    return decimal_text(x[0], x[1])
+
+
+def native_decimal_to_int(args, position):
+    a, mode = args
+    x = decimal_read("to_int", "its first argument", a, position)
+    decimal_mode("to_int", mode, position)
+    return decimal_round_div(x[0], 10 ** x[1], mode)
+
+
+def native_decimal_to_float(args, position):
+    x = decimal_read("to_float", "its argument", args[0], position)
+    if x[1] <= 300 and abs(x[0]) < 10 ** 300:
+        return x[0] / 10 ** x[1]                # int / int is correctly rounded, as float() of the text is
+    return builtin_num([decimal_text(x[0], x[1])], position)
+
+
+def native_decimal_total(args, position):
+    items = args[0]
+    if not isinstance(items, list):
+        decimal_fail("total", "needs a list, but got {}".format(type_category(items)), position)
+    unscaled, scale = 0, 0
+    for item in items:
+        x = decimal_read("total", "an item", item, position)
+        a, b, scale = decimal_aligned((unscaled, scale), x)
+        unscaled = a + b
+    return decimal_make(unscaled, scale, position)
+
+
+def native_text_chr(args, position):
+    n = decimal_whole(args[0])
+    if n is None or not 0 <= n <= 0x10FFFF or 0xD800 <= n <= 0xDFFF:
+        raise native_error("the number for text.chr() needs a whole number from 0 to 1114111, "
+                           "other than 55296 to 57343 (the surrogates)", position)
+    return chr(n)
+
+
+def native_text_ord(args, position):
+    text = args[0]
+    if not isinstance(text, str):
+        raise native_error("the text for text.ord() needs a string, but got {}".format(type_category(text)), position)
+    if len(text) != 1:
+        raise native_error("the text for text.ord() needs exactly one character, but got {}".format(len(text)), position)
+    return ord(text)
+
+
+FILE_CHUNK_LIMIT = 16 * 1024 * 1024         # the longest line files.next_lines() will read
+
+
+def file_path_argument(value, who, position):
+    path = text_argument(value, who, position)
+    reject_null_byte(path, position)
+    return path
+
+
+def native_files_size(args, position):
+    path = file_path_argument(args[0], "files.size()", position)
+    if os.path.isdir(path):
+        raise NovaError("{} is a directory, not a file".format(path), position, label="FileError")
+    try:
+        return os.path.getsize(path)
+    except FileNotFoundError:
+        raise NovaError(path, position, label="FileNotFoundError")
+    except OSError as problem:
+        raise NovaError("{}: {}".format(path, problem.strerror or "cannot be read"), position, label="FileError")
+
+
+def native_files_is_dir(args, position):
+    return os.path.isdir(file_path_argument(args[0], "files.is_dir()", position))
+
+
+def native_files_is_link(args, position):
+    return os.path.islink(file_path_argument(args[0], "files.is_link()", position))
+
+
+def native_files_next_lines(args, position):
+    """[lines, next_offset, at_end]: the whole lines in the next chunk of `path` from byte `offset`.
+
+    The file is opened, read and closed in this one call (no handle outlives it), and the caller's
+    grant was checked for this very call. A chunk ends at its last line feed, so a "\\r\\n" is never
+    cut in two; a line longer than the chunk makes the chunk grow, up to FILE_CHUNK_LIMIT bytes."""
+    path = file_path_argument(args[0], "files.next_lines()", position)
+    offset, size = decimal_whole(args[1]), decimal_whole(args[2])
+    if offset is None or offset < 0 or size is None or size < 1:
+        raise native_error("files.next_lines() needs a path, a byte offset and a chunk size", position)
+    if os.path.isdir(path):
+        raise NovaError("{} is a directory, not a file".format(path), position, label="FileError")
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(offset)
+            data = handle.read(size)
+            at_end = len(data) < size
+            while not at_end and b"\n" not in data:
+                if len(data) >= FILE_CHUNK_LIMIT:
+                    raise NovaError("{}: a line is longer than {} bytes".format(path, FILE_CHUNK_LIMIT), position, label="FileError")
+                more = handle.read(size)
+                at_end = len(more) < size
+                data += more
+            if not at_end:
+                data = data[:data.rindex(b"\n") + 1]
+    except FileNotFoundError:
+        raise NovaError(path, position, label="FileNotFoundError")
+    except OSError as problem:
+        raise NovaError("{}: {}".format(path, problem.strerror or "cannot be read"), position, label="FileError")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as problem:
+        raise NovaError("{}: {}".format(path, problem), position, label="FileError")
+    lines = builtin_split_lines([text], position) if text else []
+    return [lines, offset + len(data), at_end]
+
+
+def native_check_size(result, limit, position):
+    """A native's result may not hold a string longer than the run's string limit ([sbx.limits]); the
+    generic check of a built-in's result looks only at the top level, and a native returns lists of
+    strings (the lines of a file). `limit` is 0 when no limit applies."""
+    if not limit:
+        return
+    pending = [result]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, str):
+            if len(value) > limit:
+                raise NovaError("a string cannot grow beyond {} characters".format(limit), position)
+        elif isinstance(value, list):
+            pending.extend(value)
+
+
+# -- std:regex -------------------------------------------------------------------------------
+
+def regex_limits(interpreter):
+    """(longest list, longest string) a result of std:regex may have in this run."""
+    if getattr(interpreter, "counting", False):
+        return interpreter.limits.list, interpreter.limits.string
+    return MAX_LIST_LENGTH, REGEX_HARD_STRING
+
+
+def regex_text(who, role, value, position):
+    if not isinstance(value, str):
+        raise native_error("the {} for regex.{}() needs a string, but got {}".format(role, who, type_category(value)), position)
+    return value
+
+
+def regex_program(who, value, position):
+    pattern = regex_text(who, "pattern", value, position)
+    try:
+        return regex_compile(pattern)
+    except RegexError as problem:
+        raise NovaError("regex.{}(): bad pattern: {}".format(who, problem), position, label="TypeError")
+
+
+def regex_count(who, role, value, position):
+    count = decimal_whole(value)
+    if count is None or count < 0:
+        raise native_error("the {} for regex.{}() needs a whole number of at least 0".format(role, who), position)
+    return count
+
+
+def regex_list(who, program, text, meter, limit, interpreter, position, build):
+    cap = regex_limits(interpreter)[0]
+    out = []
+    for caps in regex_iter(program, text, meter, limit):
+        if len(out) >= cap:
+            raise NovaError("a list cannot grow beyond {} items".format(cap), position)
+        out.append(build(caps))
+    return out
+
+
+def native_regex_test(args, position, interpreter):
+    program = regex_program("test", args[0], position)
+    text = regex_text("test", "text", args[1], position)
+    return regex_search(program, text, 0, regex_meter(interpreter, position), exists=True) is not None
+
+
+def native_regex_match(args, position, interpreter):
+    program = regex_program("match", args[0], position)
+    text = regex_text("match", "text", args[1], position)
+    caps = regex_search(program, text, 0, regex_meter(interpreter, position))
+    return NOTHING if caps is None else regex_match_value(program, text, caps)
+
+
+def native_regex_match_from(args, position, interpreter):
+    program = regex_program("match_from", args[0], position)
+    text = regex_text("match_from", "text", args[1], position)
+    start = regex_count("match_from", "start", args[2], position)
+    if start > len(text):
+        raise native_error("the start for regex.match_from() is {}, past the end of a text of {} characters".format(start, len(text)), position)
+    caps = regex_search(program, text, start, regex_meter(interpreter, position))
+    return NOTHING if caps is None else regex_match_value(program, text, caps)
+
+
+def native_regex_find_all(args, position, interpreter):
+    program = regex_program("find_all", args[0], position)
+    text = regex_text("find_all", "text", args[1], position)
+    return regex_list("find_all", program, text, regex_meter(interpreter, position), None, interpreter, position,
+                      lambda caps: regex_match_value(program, text, caps))
+
+
+def native_regex_find_n(args, position, interpreter):
+    program = regex_program("find_n", args[0], position)
+    text = regex_text("find_n", "text", args[1], position)
+    limit = regex_count("find_n", "limit", args[2], position)
+    return regex_list("find_n", program, text, regex_meter(interpreter, position), limit, interpreter, position,
+                      lambda caps: regex_match_value(program, text, caps))
+
+
+def regex_substitute(who, program, template, text, limit, interpreter, position):
+    meter = regex_meter(interpreter, position)
+    cap = regex_limits(interpreter)[1]
+    out = []
+    size = 0
+    last = 0
+    for caps in regex_iter(program, text, meter, limit):
+        pieces = [text[last:caps[0]]]
+        for item in template:
+            if isinstance(item, int):
+                begin, end = caps[2 * item], caps[2 * item + 1]
+                pieces.append("" if begin is None or end is None else text[begin:end])
+            else:
+                pieces.append(item)
+        for piece in pieces:
+            size += len(piece)
+            out.append(piece)
+        if size > cap:
+            raise NovaError("a string cannot grow beyond {} characters".format(cap), position)
+        last = caps[1]
+    out.append(text[last:])
+    return "".join(out)
+
+
+def regex_replacement(who, program, value, position):
+    replacement = regex_text(who, "replacement", value, position)
+    try:
+        return regex_template(program, replacement)
+    except RegexError as problem:
+        raise NovaError("regex.{}(): bad replacement: {}".format(who, problem), position, label="TypeError")
+
+
+def native_regex_sub(args, position, interpreter):
+    program = regex_program("sub", args[0], position)
+    template = regex_replacement("sub", program, args[1], position)
+    text = regex_text("sub", "text", args[2], position)
+    return regex_substitute("sub", program, template, text, None, interpreter, position)
+
+
+def native_regex_sub_n(args, position, interpreter):
+    program = regex_program("sub_n", args[0], position)
+    template = regex_replacement("sub_n", program, args[1], position)
+    text = regex_text("sub_n", "text", args[2], position)
+    count = regex_count("sub_n", "count", args[3], position)
+    return regex_substitute("sub_n", program, template, text, count, interpreter, position)
+
+
+def regex_pieces(who, program, text, limit, interpreter, position):
+    meter = regex_meter(interpreter, position)
+    cap = regex_limits(interpreter)[0]
+    out = []
+    last = 0
+    for caps in regex_iter(program, text, meter, limit):
+        if len(out) >= cap:
+            raise NovaError("a list cannot grow beyond {} items".format(cap), position)
+        out.append(text[last:caps[0]])
+        last = caps[1]
+    out.append(text[last:])
+    return out
+
+
+def native_regex_pieces(args, position, interpreter):
+    program = regex_program("pieces", args[0], position)
+    text = regex_text("pieces", "text", args[1], position)
+    return regex_pieces("pieces", program, text, None, interpreter, position)
+
+
+def native_regex_pieces_n(args, position, interpreter):
+    program = regex_program("pieces_n", args[0], position)
+    text = regex_text("pieces_n", "text", args[1], position)
+    limit = regex_count("pieces_n", "limit", args[2], position)
+    return regex_pieces("pieces_n", program, text, limit, interpreter, position)
+
+
+def native_builtin_regex(args, position, interpreter):
+    return builtin_regex(args, position, interpreter)
+
+
+def native_regex_escape(args, position, interpreter):
+    return regex_escape(regex_text("escape", "text", args[0], position))
+
+
+class _HostView:
+    """What a native sees of the self-hosted engine: no limits (they are the engine's own) and a way to charge
+    work to the engine's counters, which `work` (a function of the engine's, called with the units of work done)
+    adds to its step budget and time check, as Interpreter.step and charge do for the Python engines."""
+    counting = False
+
+    def __init__(self, interpreter, work):
+        self.interpreter = interpreter
+        self.work = work
+
+    def step(self, position=None):
+        pass
+
+    def charge(self, units, position=None):
+        if self.work is not None:
+            self.interpreter.call_value(self.work, [units], position)
+
+
+# -- std:hash and files.sha256_file --------------------------------------------------------
+
+HASH_CHUNK = 64 * 1024
+
+
+def native_hash_sha256(args, position):
+    text = args[0]
+    if not isinstance(text, str):
+        raise native_error("the text for hash.sha256() needs a string, but got {}".format(type_category(text)), position)
+    try:
+        data = text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise native_error("the text for hash.sha256() has a character that cannot be written as UTF-8", position)
+    return hashlib.sha256(data).hexdigest()
+
+
+def native_files_sha256_file(args, position, interpreter):
+    """The SHA-256 of a file's bytes, hex, read in pieces (the file is opened, read and closed in this one call). The grant was
+    checked for this path before the call; the work is charged to the run, 4 steps for every piece."""
+    path = file_path_argument(args[0], "files.sha256_file()", position)
+    if os.path.isdir(path):
+        raise NovaError("{} is a directory, not a file".format(path), position, label="FileError")
+    meter = regex_meter(interpreter, position)
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as handle:
+            while True:
+                piece = handle.read(HASH_CHUNK)
+                if not piece:
+                    break
+                digest.update(piece)
+                meter.tick(4 * REGEX_UNIT)
+    except FileNotFoundError:
+        raise NovaError(path, position, label="FileNotFoundError")
+    except OSError as problem:
+        raise NovaError("{}: {}".format(path, problem.strerror or "cannot be read"), position, label="FileError")
+    return digest.hexdigest()
+
+
+# -- std:date -------------------------------------------------------------------------------
+#
+# Civil dates and timestamps with a numeric UTC offset, as text: a date is "2027-01-31", a timestamp is
+# "2027-01-31T13:55:36+00:00" (whole seconds, the offset always written +HH:MM). Years 1 to 9999, the
+# proleptic Gregorian calendar, no time zones and no daylight saving. Nothing here reads the clock.
+
+DATE_FORM = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})\Z", re.ASCII)
+TIMESTAMP_FORM = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})([+-])([0-9]{2}):([0-9]{2})\Z", re.ASCII)
+OFFSET_FORM = re.compile(r"(?:(Z)|([+-])([0-9]{2}):?([0-9]{2}))\Z", re.ASCII)
+MONTH_NAMES = ("January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December")
+DAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+DATE_DAYS_LIMIT = 4000000          # a whole number of days or seconds of this size or more is out of the calendar anyway
+DATE_SECONDS_LIMIT = 400000000000
+
+
+def date_fail(who, what, position):
+    raise native_error("date.{}() {}".format(who, what), position)
+
+
+def date_whole(who, role, value, position, limit=1000000):
+    n = decimal_whole(value)
+    if n is None:
+        date_fail(who, "needs a whole number for the {}, but got {}".format(role, type_category(value) if not isinstance(value, (int, float)) or isinstance(value, bool) else "a number with a fraction"), position)
+    if abs(n) >= limit:            # far beyond any date: refused here so that no later conversion can overflow a C long
+        date_fail(who, "has a {} that is out of the calendar".format(role), position)
+    return n
+
+
+def date_value(who, role, value, position):
+    if not isinstance(value, str):
+        date_fail(who, "needs a string for the {}, but got {}".format(role, type_category(value)), position)
+    found = DATE_FORM.match(value)
+    if found:
+        try:
+            return calendar_date(*[int(part) for part in found.groups()])
+        except ValueError:
+            pass
+    date_fail(who, "needs a date written 2027-01-31 for the {}, and {!r} is not a date of the calendar".format(role, value[:40]), position)
+
+
+def offset_minutes(text):
+    """Minutes east of UTC from `Z`, `+HH:MM` or `+HHMM`, or None."""
+    found = OFFSET_FORM.match(text)
+    if not found:
+        return None
+    if found.group(1):
+        return 0
+    hours, minutes = int(found.group(3)), int(found.group(4))
+    if hours > 23 or minutes > 59:
+        return None
+    return (hours * 60 + minutes) * (1 if found.group(2) == "+" else -1)
+
+
+def offset_text(minutes):
+    sign = "-" if minutes < 0 else "+"
+    return "{}{:02d}:{:02d}".format(sign, abs(minutes) // 60, abs(minutes) % 60)
+
+
+def offset_value(who, role, value, position):
+    if not isinstance(value, str):
+        date_fail(who, "needs a string for the {}, but got {}".format(role, type_category(value)), position)
+    minutes = offset_minutes(value)
+    if minutes is None:
+        date_fail(who, "needs an offset written Z, +01:00 or -0500 for the {}, not {!r}".format(role, value[:20]), position)
+    return minutes
+
+
+def timestamp_value(who, role, value, position):
+    """A datetime that knows its offset, from the normalized form."""
+    if not isinstance(value, str):
+        date_fail(who, "needs a string for the {}, but got {}".format(role, type_category(value)), position)
+    found = TIMESTAMP_FORM.match(value)
+    if found:
+        year, month, day, hour, minute, second = [int(found.group(i)) for i in range(1, 7)]
+        minutes = offset_minutes(found.group(7) + found.group(8) + found.group(9))
+        if minutes is not None:
+            try:
+                return datetime(year, month, day, hour, minute, second, tzinfo=timezone(timedelta(minutes=minutes)))
+            except ValueError:
+                pass
+    date_fail(who, "needs a timestamp written 2027-01-31T13:55:36+00:00 for the {}, and {!r} is not one".format(role, value[:40]), position)
+
+
+def date_text(d):
+    return "{:04d}-{:02d}-{:02d}".format(d.year, d.month, d.day)
+
+
+def timestamp_text(moment):
+    return "{:04d}-{:02d}-{:02d}T{:02d}:{:02d}:{:02d}{}".format(
+        moment.year, moment.month, moment.day, moment.hour, moment.minute, moment.second,
+        offset_text(int(moment.utcoffset().total_seconds()) // 60))
+
+
+def date_shift(who, d, days, position):
+    try:
+        return d + timedelta(days=days)
+    except OverflowError:
+        date_fail(who, "gives a date outside the years 1 to 9999", position)
+
+
+def month_length(year, month):
+    if month == 2:
+        return 29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28
+    return 30 if month in (4, 6, 9, 11) else 31
+
+
+def months_shifted(who, d, months, position):
+    index = d.year * 12 + (d.month - 1) + months
+    year, month = divmod(index, 12)
+    if not 1 <= year <= 9999:
+        date_fail(who, "gives a date outside the years 1 to 9999", position)
+    return calendar_date(year, month + 1, min(d.day, month_length(year, month + 1)))     # the month-end rule: the last day if there is no such day
+
+
+def native_date_is_date(args, position):
+    if not isinstance(args[0], str):
+        date_fail("is_date", "needs a string, but got {}".format(type_category(args[0])), position)
+    found = DATE_FORM.match(args[0])
+    if not found:
+        return False
+    try:
+        calendar_date(*[int(part) for part in found.groups()])
+    except ValueError:
+        return False
+    return True
+
+
+def native_date_is_timestamp(args, position):
+    if not isinstance(args[0], str):
+        date_fail("is_timestamp", "needs a string, but got {}".format(type_category(args[0])), position)
+    try:
+        timestamp_value("is_timestamp", "text", args[0], position)
+    except NovaError:
+        return False
+    return True
+
+
+def native_date_make(args, position):
+    year, month, day = (date_whole("make", role, value, position) for role, value in (("year", args[0]), ("month", args[1]), ("day", args[2])))
+    try:
+        return date_text(calendar_date(year, month, day))
+    except ValueError:
+        date_fail("make", "has no date for year {}, month {}, day {}".format(year, month, day), position)
+
+
+def native_date_year(args, position):
+    return date_value("year", "date", args[0], position).year
+
+
+def native_date_month(args, position):
+    return date_value("month", "date", args[0], position).month
+
+
+def native_date_day(args, position):
+    return date_value("day", "date", args[0], position).day
+
+
+def native_date_is_leap(args, position):
+    year = date_whole("is_leap", "year", args[0], position)
+    if not 1 <= year <= 9999:
+        date_fail("is_leap", "needs a year from 1 to 9999", position)
+    return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+
+
+def native_date_days_in_month(args, position):
+    year, month = date_whole("days_in_month", "year", args[0], position), date_whole("days_in_month", "month", args[1], position)
+    if not 1 <= year <= 9999 or not 1 <= month <= 12:
+        date_fail("days_in_month", "needs a year from 1 to 9999 and a month from 1 to 12", position)
+    return month_length(year, month)
+
+
+def native_date_last_day_of_month(args, position):
+    d = date_value("last_day_of_month", "date", args[0], position)
+    return date_text(calendar_date(d.year, d.month, month_length(d.year, d.month)))
+
+
+def native_date_add_days(args, position):
+    d = date_value("add_days", "date", args[0], position)
+    return date_text(date_shift("add_days", d, date_whole("add_days", "number of days", args[1], position, DATE_DAYS_LIMIT), position))
+
+
+def native_date_add_months(args, position):
+    d = date_value("add_months", "date", args[0], position)
+    return date_text(months_shifted("add_months", d, date_whole("add_months", "number of months", args[1], position, 200000), position))
+
+
+def native_date_add_years(args, position):
+    d = date_value("add_years", "date", args[0], position)
+    return date_text(months_shifted("add_years", d, 12 * date_whole("add_years", "number of years", args[1], position, 20000), position))
+
+
+def native_date_diff_days(args, position):
+    return (date_value("diff_days", "first date", args[0], position) - date_value("diff_days", "second date", args[1], position)).days
+
+
+def native_date_weekday(args, position):
+    return date_value("weekday", "date", args[0], position).isoweekday()          # Monday is 1, Sunday is 7
+
+
+def native_date_day_of_year(args, position):
+    return date_value("day_of_year", "date", args[0], position).timetuple().tm_yday
+
+
+def native_date_compare(args, position):
+    a, b = args[0], args[1]
+    both_dates = isinstance(a, str) and isinstance(b, str) and DATE_FORM.match(a) and DATE_FORM.match(b)
+    if both_dates:
+        left, right = date_value("compare", "first value", a, position), date_value("compare", "second value", b, position)
+    else:
+        left, right = timestamp_value("compare", "first value", a, position), timestamp_value("compare", "second value", b, position)
+    return (left > right) - (left < right)
+
+
+# timestamps
+
+def native_date_make_timestamp(args, position):
+    names = ("year", "month", "day", "hour", "minute", "second")
+    year, month, day, hour, minute, second = (date_whole("make_timestamp", names[i], args[i], position) for i in range(6))
+    minutes = offset_value("make_timestamp", "offset", args[6], position)
+    try:
+        return timestamp_text(datetime(year, month, day, hour, minute, second, tzinfo=timezone(timedelta(minutes=minutes))))
+    except ValueError:
+        date_fail("make_timestamp", "has no timestamp for these numbers", position)
+
+
+def native_date_date_of(args, position):
+    return date_text(timestamp_value("date_of", "timestamp", args[0], position))      # the civil date in the timestamp's own offset
+
+
+def native_date_offset_of(args, position):
+    return offset_text(int(timestamp_value("offset_of", "timestamp", args[0], position).utcoffset().total_seconds()) // 60)
+
+
+def native_date_with_offset(args, position):
+    moment = timestamp_value("with_offset", "timestamp", args[0], position)
+    minutes = offset_value("with_offset", "offset", args[1], position)
+    try:
+        return timestamp_text(moment.astimezone(timezone(timedelta(minutes=minutes))))
+    except OverflowError:
+        date_fail("with_offset", "gives a timestamp outside the years 1 to 9999", position)
+
+
+def native_date_to_utc(args, position):
+    return native_date_with_offset([args[0], "Z"], position)
+
+
+def native_date_add_seconds(args, position):
+    moment = timestamp_value("add_seconds", "timestamp", args[0], position)
+    seconds = date_whole("add_seconds", "number of seconds", args[1], position, DATE_SECONDS_LIMIT)
+    try:
+        return timestamp_text(moment + timedelta(seconds=seconds))
+    except OverflowError:
+        date_fail("add_seconds", "gives a timestamp outside the years 1 to 9999", position)
+
+
+def native_date_diff_seconds(args, position):
+    delta = timestamp_value("diff_seconds", "first timestamp", args[0], position) - timestamp_value("diff_seconds", "second timestamp", args[1], position)
+    return delta.days * 86400 + delta.seconds
+
+
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def native_date_to_epoch(args, position):
+    delta = timestamp_value("to_epoch", "timestamp", args[0], position) - EPOCH
+    return delta.days * 86400 + delta.seconds
+
+
+def native_date_from_epoch(args, position):
+    seconds = date_whole("from_epoch", "seconds", args[0], position, DATE_SECONDS_LIMIT)
+    minutes = offset_value("from_epoch", "offset", args[1], position)
+    try:
+        return timestamp_text((EPOCH + timedelta(seconds=seconds)).astimezone(timezone(timedelta(minutes=minutes))))
+    except (OverflowError, ValueError):
+        date_fail("from_epoch", "gives a timestamp outside the years 1 to 9999", position)
+
+
+# formats: %Y %m %d %e %H %M %S %b %B %a %A %z %f %%  (English names, never the locale's)
+
+FORMAT_TOKENS = "YmdeHMSbBaAzf%"
+
+
+def format_tokens(who, fmt, position):
+    if not isinstance(fmt, str):
+        date_fail(who, "needs a string for the format, but got {}".format(type_category(fmt)), position)
+    out, i = [], 0
+    while i < len(fmt):
+        if fmt[i] != "%":
+            out.append(("lit", fmt[i]))
+            i += 1
+            continue
+        if i + 1 >= len(fmt) or fmt[i + 1] not in FORMAT_TOKENS:
+            date_fail(who, "does not know the format code {!r} (the codes are %Y %m %d %e %H %M %S %b %B %a %A %z %f and %%)".format(fmt[i:i + 2]), position)
+        out.append(("lit", "%") if fmt[i + 1] == "%" else ("tok", fmt[i + 1]))
+        i += 2
+    return out
+
+
+def native_date_format(args, position):
+    value, fmt = args[0], args[1]
+    tokens = format_tokens("format", fmt, position)
+    moment, stamped = None, False
+    if isinstance(value, str) and TIMESTAMP_FORM.match(value):
+        moment, stamped = timestamp_value("format", "value", value, position), True
+        d = moment.date()
+    else:
+        d = date_value("format", "value", value, position)
+    out = []
+    for kind, item in tokens:
+        if kind == "lit":
+            out.append(item)
+            continue
+        if item in "HMSzf" and not stamped:
+            date_fail("format", "has %{} but the value is a date, which has no time of day; give it a timestamp".format(item), position)
+        if item == "f":
+            date_fail("format", "cannot write %f: timestamps have whole seconds", position)
+        out.append({"Y": lambda: "{:04d}".format(d.year), "m": lambda: "{:02d}".format(d.month), "d": lambda: "{:02d}".format(d.day),
+                    "e": lambda: "{:2d}".format(d.day), "b": lambda: MONTH_NAMES[d.month - 1][:3], "B": lambda: MONTH_NAMES[d.month - 1],
+                    "a": lambda: DAY_NAMES[d.weekday()][:3], "A": lambda: DAY_NAMES[d.weekday()],
+                    "H": lambda: "{:02d}".format(moment.hour), "M": lambda: "{:02d}".format(moment.minute), "S": lambda: "{:02d}".format(moment.second),
+                    "z": lambda: offset_text(int(moment.utcoffset().total_seconds()) // 60).replace(":", "")}[item]())
+    return "".join(out)
+
+
+def parse_by_format(who, text, fmt, position):
+    """{field: value} read from `text` by `fmt`, or the error that says where it stopped."""
+    if not isinstance(text, str):
+        date_fail(who, "needs a string for the text, but got {}".format(type_category(text)), position)
+    tokens = format_tokens(who, fmt, position)
+    fields, i = {}, 0
+
+    def stop(what):
+        date_fail(who, "could not read {!r} with the format {!r}: {} at character {}".format(text[:60], fmt[:60], what, i), position)
+
+    def digits(count, name):
+        nonlocal i
+        piece = text[i:i + count]
+        if len(piece) != count or not all("0" <= c <= "9" for c in piece):
+            stop("expected {} digits for {}".format(count, name))
+        i += count
+        return int(piece)
+
+    def name_of(names, full, name):
+        nonlocal i
+        for index, candidate in enumerate(names):
+            word = candidate if full else candidate[:3]
+            if text[i:i + len(word)].lower() == word.lower():
+                i += len(word)
+                return index
+        stop("expected {}".format(name))
+
+    for kind, item in tokens:
+        if kind == "lit":
+            if text[i:i + 1] != item:
+                stop("expected {!r}".format(item))
+            i += 1
+        elif item == "Y":
+            fields["year"] = digits(4, "the year")
+        elif item == "m":
+            fields["month"] = digits(2, "the month")
+        elif item == "d":
+            fields["day"] = digits(2, "the day")
+        elif item == "e":
+            while text[i:i + 1] == " ":
+                i += 1
+            start = i
+            while i < len(text) and i - start < 2 and "0" <= text[i] <= "9":
+                i += 1
+            if i == start:
+                stop("expected the day of the month")
+            fields["day"] = int(text[start:i])
+        elif item == "H":
+            fields["hour"] = digits(2, "the hour")
+        elif item == "M":
+            fields["minute"] = digits(2, "the minute")
+        elif item == "S":
+            fields["second"] = digits(2, "the second")
+        elif item == "b":
+            fields["month"] = name_of(MONTH_NAMES, False, "a month name such as Oct") + 1
+        elif item == "B":
+            fields["month"] = name_of(MONTH_NAMES, True, "a month name such as October") + 1
+        elif item == "a":
+            fields["weekday"] = name_of(DAY_NAMES, False, "a day name such as Mon")
+        elif item == "A":
+            fields["weekday"] = name_of(DAY_NAMES, True, "a day name such as Monday")
+        elif item == "f":
+            start = i
+            while i < len(text) and "0" <= text[i] <= "9":
+                i += 1
+            if not 1 <= i - start <= 9:
+                stop("expected 1 to 9 digits of a fraction")
+        elif item == "z":
+            found = OFFSET_FORM.match(text[i:i + 6]) or OFFSET_FORM.match(text[i:i + 5]) or OFFSET_FORM.match(text[i:i + 1])
+            if not found or offset_minutes(found.group(0)) is None:
+                stop("expected an offset such as +0100, +01:00 or Z")
+            fields["offset"] = offset_minutes(found.group(0))
+            i += len(found.group(0))
+    if i != len(text):
+        stop("the text has more after the format ended")
+    return fields
+
+
+def date_from_fields(who, fields, position):
+    for needed, code in (("year", "%Y"), ("month", "%m or %b"), ("day", "%d")):
+        if needed not in fields:
+            date_fail(who, "needs the format to read the {} ({})".format(needed, code), position)
+    try:
+        d = calendar_date(fields["year"], fields["month"], fields["day"])
+    except ValueError:
+        date_fail(who, "read {:04d}-{:02d}-{:02d}, which is not a date of the calendar".format(fields["year"], fields["month"], fields["day"]), position)
+    if "weekday" in fields and fields["weekday"] != d.weekday():
+        date_fail(who, "read a day name that is not the weekday of {}".format(date_text(d)), position)
+    return d
+
+
+def native_date_parse_date(args, position):
+    return date_text(date_from_fields("parse_date", parse_by_format("parse_date", args[0], args[1], position), position))
+
+
+def timestamp_from(who, args, position, fixed_offset):
+    fields = parse_by_format(who, args[0], args[1], position)
+    d = date_from_fields(who, fields, position)
+    for needed, code in (("hour", "%H"), ("minute", "%M"), ("second", "%S")):
+        if needed not in fields:
+            date_fail(who, "needs the format to read the {} ({})".format(needed, code), position)
+    if fixed_offset is None:
+        if "offset" not in fields:
+            date_fail(who, "needs the format to read the offset (%z); if the text has none, use date.parse_timestamp_at() and give the offset", position)
+        minutes = fields["offset"]
+    else:
+        if "offset" in fields:
+            date_fail(who, "was given an offset and the format also reads one (%z): use date.parse_timestamp() instead", position)
+        minutes = fixed_offset
+    try:
+        return timestamp_text(datetime(d.year, d.month, d.day, fields["hour"], fields["minute"], fields["second"], tzinfo=timezone(timedelta(minutes=minutes))))
+    except ValueError:
+        date_fail(who, "read a time of day that does not exist", position)
+
+
+def native_date_parse_timestamp(args, position):
+    return timestamp_from("parse_timestamp", args, position, None)
+
+
+def native_date_parse_timestamp_at(args, position):
+    return timestamp_from("parse_timestamp_at", args, position, offset_value("parse_timestamp_at", "offset", args[2], position))
+
+
+# -- std:csv ---------------------------------------------------------------------------------
+#
+# RFC 4180 records ([lib.std-csv]): a field is either unquoted (no delimiter, quote or line end in it) or quoted ("...", a quote
+# inside written twice, line ends inside kept as they are). A record ends at CRLF, LF or CR; a line with nothing on it is not a
+# record; a byte order mark at the very start of the text is dropped. Anything else is an error that names the line. The work is
+# charged to the run like the matcher's: one unit for every character read or written.
+
+CSV_MAX_FIELDS = 10000
+CSV_OPTIONS = ("delimiter", "max_fields")
+_CSV_UNQUOTED = {}
+
+
+def csv_fail(who, what, position):
+    raise native_error("csv.{}() {}".format(who, what), position)
+
+
+def csv_text(who, value, position):
+    if not isinstance(value, str):
+        csv_fail(who, "needs a string for the text, but got {}".format(type_name(value)), position)
+    return value
+
+
+def csv_options(who, value, position):
+    if not isinstance(value, dict):
+        csv_fail(who, "needs a dictionary for the options, but got {}".format(type_name(value)), position)
+    for key in value:
+        if key not in CSV_OPTIONS:
+            csv_fail(who, "does not know the option '{}' (the options are delimiter and max_fields)".format(key[:40]), position)
+    delimiter, max_fields = ",", CSV_MAX_FIELDS
+    if "delimiter" in value:
+        delimiter = value["delimiter"]
+        if not isinstance(delimiter, str) or len(delimiter) != 1 or delimiter in '"\r\n':
+            csv_fail(who, "needs the delimiter to be one character that is not a quote or a line end", position)
+    if "max_fields" in value:
+        max_fields = decimal_whole(value["max_fields"])
+        if max_fields is None or max_fields < 1:
+            csv_fail(who, "needs max_fields to be a whole number of at least 1", position)
+    return delimiter, max_fields
+
+
+def _line_ends(piece):
+    """How many line ends (CRLF counts once) are in `piece`."""
+    return piece.count("\n") + piece.count("\r") - piece.count("\r\n")
+
+
+def csv_read(who, text, delimiter, max_fields, interpreter, position):
+    longest_list, _ = regex_limits(interpreter)
+    meter = regex_meter(interpreter, position)
+    unquoted = _CSV_UNQUOTED.get(delimiter)
+    if unquoted is None:
+        unquoted = _CSV_UNQUOTED[delimiter] = re.compile('[^"\r\n' + re.escape(delimiter) + "]*")
+    if text.startswith("﻿"):
+        text = text[1:]
+    rows, i, n, line = [], 0, len(text), 1
+    while i < n:
+        if text[i] in "\r\n":                                        # a line with nothing on it is not a record
+            i += 2 if text.startswith("\r\n", i) else 1
+            line += 1
+            continue
+        start, record_line, row = i, line, []
+        while True:
+            if i < n and text[i] == '"':
+                opened_on, i, parts = line, i + 1, []
+                while True:
+                    close = text.find('"', i)
+                    if close < 0:
+                        csv_fail(who, "found a quoted field that is never closed; it starts on line {}".format(opened_on), position)
+                    piece = text[i:close]
+                    line += _line_ends(piece)
+                    parts.append(piece)
+                    if text.startswith('""', close):
+                        parts.append('"')
+                        i = close + 2
+                        continue
+                    i = close + 1
+                    break
+                if i < n and text[i] != delimiter and text[i] not in "\r\n":
+                    csv_fail(who, "found text after the closing quote of a field on line {}; a quoted field must end at the delimiter or the end "
+                                  "of the line".format(line), position)
+                field = "".join(parts)
+            else:
+                end = unquoted.match(text, i).end()
+                if end < n and text[end] == '"':
+                    csv_fail(who, "found a quote inside a field that does not start with one on line {}; quote the whole field and write the "
+                                  "quote twice".format(line), position)
+                field, i = text[i:end], end
+            row.append(field)
+            if len(row) > max_fields:
+                csv_fail(who, "found more than {} fields in the record on line {} (the max_fields limit)".format(max_fields, record_line), position)
+            if i < n and text[i] == delimiter:
+                i += 1
+                continue
+            break
+        if i < n:                                                    # the line end that ends the record
+            i += 2 if text.startswith("\r\n", i) else 1
+            line += 1
+        rows.append(row)
+        if len(rows) > longest_list:
+            raise NovaError("a list cannot grow beyond {} items".format(longest_list), position)
+        meter.tick(i - start)
+    return rows
+
+
+def native_csv_parse(args, position, interpreter):
+    return csv_read("parse", csv_text("parse", args[0], position), ",", CSV_MAX_FIELDS, interpreter, position)
+
+
+def native_csv_parse_with(args, position, interpreter):
+    text = csv_text("parse_with", args[0], position)
+    delimiter, max_fields = csv_options("parse_with", args[1], position)
+    return csv_read("parse_with", text, delimiter, max_fields, interpreter, position)
+
+
+def native_csv_parse_lines(args, position, interpreter):
+    lines = args[0]
+    if not isinstance(lines, list):
+        csv_fail("parse_lines", "needs a list of strings, but got {}".format(type_name(lines)), position)
+    for number, item in enumerate(lines, 1):
+        if not isinstance(item, str):
+            csv_fail("parse_lines", "needs a list of strings, and item {} is {}".format(number, type_name(item)), position)
+    return csv_read("parse_lines", "\n".join(lines), ",", CSV_MAX_FIELDS, interpreter, position)
+
+
+def native_csv_records(args, position):
+    rows = args[0]
+    if not isinstance(rows, list):
+        csv_fail("records", "needs a list of rows, but got {}".format(type_name(rows)), position)
+    for number, row in enumerate(rows, 1):
+        if not isinstance(row, list):
+            csv_fail("records", "needs a list of rows, and row {} is {}".format(number, type_name(row)), position)
+        for place, field in enumerate(row, 1):
+            if not isinstance(field, str):
+                csv_fail("records", "needs the fields to be strings, and row {} field {} is {}".format(number, place, type_name(field)), position)
+    if not rows:
+        return []
+    header = rows[0]
+    if len(set(header)) != len(header):
+        seen = set()
+        for name in header:
+            if name in seen:
+                csv_fail("records", "found the column name '{}' twice in the header".format(name[:40]), position)
+            seen.add(name)
+    out = []
+    for number, row in enumerate(rows[1:], 2):
+        if len(row) != len(header):
+            csv_fail("records", "found {} field(s) in row {}, but the header has {}".format(len(row), number, len(header)), position)
+        out.append(dict(zip(header, row)))
+    return out
+
+
+def csv_field(who, where, value, position):
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        csv_fail(who, "needs strings or numbers, and {} is {}".format(where, type_name(value)), position)
+    text = value if isinstance(value, str) else format_value(value)
+    if '"' in text or "," in text or "\r" in text or "\n" in text:
+        return '"' + text.replace('"', '""') + '"'
+    return text
+
+
+def csv_row(who, row, label, position):
+    if len(row) == 1 and row[0] == "":
+        return '""'                     # a record of one empty field; written bare it would be a blank line, which is no record
+    return ",".join(csv_field(who, label + "field {}".format(place), value, position) for place, value in enumerate(row, 1))
+
+
+def native_csv_format_row(args, position):
+    row = args[0]
+    if not isinstance(row, list):
+        csv_fail("format_row", "needs a list of fields, but got {}".format(type_name(row)), position)
+    if not row:
+        csv_fail("format_row", "needs at least one field", position)
+    return csv_row("format_row", row, "", position)
+
+
+def native_csv_format(args, position, interpreter):
+    rows = args[0]
+    if not isinstance(rows, list):
+        csv_fail("format", "needs a list of rows, but got {}".format(type_name(rows)), position)
+    meter = regex_meter(interpreter, position)
+    out = []
+    for number, row in enumerate(rows, 1):
+        if not isinstance(row, list):
+            csv_fail("format", "needs a list of rows, and row {} is {}".format(number, type_name(row)), position)
+        if not row:
+            csv_fail("format", "needs at least one field in row {}".format(number), position)
+        out.append(csv_row("format", row, "row {} ".format(number), position) + "\r\n")
+        meter.tick(len(out[-1]))
+    return "".join(out)
+
+
+# -- std:dict --------------------------------------------------------------------------------
+#
+# A missing value without a new global name (D-P6, [lib.std-dict]): the program says what it wants when a key is absent.
+
+def std_dict_argument(who, value, position):
+    if not isinstance(value, dict):
+        raise NovaError("dict.{}() needs a dictionary, but got {}".format(who, type_name(value)), position, label="TypeError")
+    return value
+
+
+def native_dict_get(args, position):
+    d = std_dict_argument("get", args[0], position)
+    key = args[1]
+    if not isinstance(key, str):
+        raise NovaError("dict.get() needs a string for the key, but got {}".format(type_name(key)), position, label="TypeError")
+    return d[key] if key in d else args[2]
+
+
+def native_dict_get_path(args, position):
+    value = std_dict_argument("get_path", args[0], position)
+    path = args[1]
+    if not isinstance(path, list):
+        raise NovaError("dict.get_path() needs a list of keys for the path, but got {}".format(type_name(path)), position, label="TypeError")
+    for number, key in enumerate(path, 1):
+        if not isinstance(key, str):
+            raise NovaError("dict.get_path() needs the keys of the path to be strings, and key {} is {}".format(number, type_name(key)),
+                            position, label="TypeError")
+    for key in path:
+        if not isinstance(value, dict) or key not in value:
+            return args[2]
+        value = value[key]
+    return value
+
+
+def _natives(module, table, metered=()):
+    """The BuiltinFunctions of a module's natives. A function named in `metered` is also given the interpreter
+    (or, for the self-hosted engine, a view of its host), to charge its work to the run."""
+    def guarded(implementation, wants_interpreter):
+        def run(args, position, interpreter):
+            if wants_interpreter:
+                result = implementation(args, position, interpreter)
+            else:
+                result = implementation(args, position)
+            native_check_size(result, interpreter.limits.string if interpreter.counting else 0, position)
+            return result
+        return run
+    return {name: BuiltinFunction("{}.{}".format(module, name), arity, guarded(implementation, name in metered),
+                                  needs_interpreter=True, paths=paths)
+            for name, (arity, implementation, paths) in table.items()}
+
+
+READ_PATH = ((0, "read"),)
+NATIVE_FUNCTIONS = {
+    "decimal": _natives("decimal", {
+        "parse": (1, native_decimal_parse, ()), "try_parse": (1, native_decimal_try_parse, ()),
+        "from_int": (1, native_decimal_from_int, ()), "from_float": (3, native_decimal_from_float, ()),
+        "is_decimal": (1, native_decimal_is_decimal, ()), "scale": (1, native_decimal_scale, ()),
+        "add": (2, native_decimal_add, ()), "sub": (2, native_decimal_sub, ()), "mul": (2, native_decimal_mul, ()),
+        "div": (4, native_decimal_div, ()), "quantize": (3, native_decimal_quantize, ()),
+        "negate": (1, native_decimal_negate, ()), "absolute": (1, native_decimal_absolute, ()),
+        "sign": (1, native_decimal_sign, ()), "cmp": (2, native_decimal_cmp, ()),
+        "to_string": (1, native_decimal_to_string, ()), "to_int": (2, native_decimal_to_int, ()),
+        "to_float": (1, native_decimal_to_float, ()), "total": (1, native_decimal_total, ()),
+    }),
+    "text": _natives("text", {"chr": (1, native_text_chr, ()), "ord": (1, native_text_ord, ())}),
+    "hash": _natives("hash", {"sha256": (1, native_hash_sha256, ())}),
+    "csv": _natives("csv", {
+        "parse": (1, native_csv_parse, ()), "parse_with": (2, native_csv_parse_with, ()),
+        "parse_lines": (1, native_csv_parse_lines, ()), "records": (1, native_csv_records, ()),
+        "format_row": (1, native_csv_format_row, ()), "format": (1, native_csv_format, ()),
+    }, metered=("parse", "parse_with", "parse_lines", "format")),
+    "dict": _natives("dict", {"get": (3, native_dict_get, ()), "get_path": (3, native_dict_get_path, ())}),
+    "date": _natives("date", {
+        "is_date": (1, native_date_is_date, ()),
+        "is_timestamp": (1, native_date_is_timestamp, ()),
+        "make": (3, native_date_make, ()),
+        "year": (1, native_date_year, ()),
+        "month": (1, native_date_month, ()),
+        "day": (1, native_date_day, ()),
+        "is_leap": (1, native_date_is_leap, ()),
+        "days_in_month": (2, native_date_days_in_month, ()),
+        "last_day_of_month": (1, native_date_last_day_of_month, ()),
+        "add_days": (2, native_date_add_days, ()),
+        "add_months": (2, native_date_add_months, ()),
+        "add_years": (2, native_date_add_years, ()),
+        "diff_days": (2, native_date_diff_days, ()),
+        "weekday": (1, native_date_weekday, ()),
+        "day_of_year": (1, native_date_day_of_year, ()),
+        "compare": (2, native_date_compare, ()),
+        "make_timestamp": (7, native_date_make_timestamp, ()),
+        "date_of": (1, native_date_date_of, ()),
+        "offset_of": (1, native_date_offset_of, ()),
+        "with_offset": (2, native_date_with_offset, ()),
+        "to_utc": (1, native_date_to_utc, ()),
+        "add_seconds": (2, native_date_add_seconds, ()),
+        "diff_seconds": (2, native_date_diff_seconds, ()),
+        "to_epoch": (1, native_date_to_epoch, ()),
+        "from_epoch": (2, native_date_from_epoch, ()),
+        "format": (2, native_date_format, ()),
+        "parse_date": (2, native_date_parse_date, ()),
+        "parse_timestamp": (2, native_date_parse_timestamp, ()),
+        "parse_timestamp_at": (3, native_date_parse_timestamp_at, ()),
+    }),
+    # not a module: the global regex() for the self-hosted engine, so that its work is charged to the engine's counters
+    "builtin": _natives("builtin", {"regex": (2, native_builtin_regex, ())}, metered=("regex",)),
+    "regex": _natives("regex", {
+        "test": (2, native_regex_test, ()), "match": (2, native_regex_match, ()),
+        "match_from": (3, native_regex_match_from, ()), "find_all": (2, native_regex_find_all, ()),
+        "find_n": (3, native_regex_find_n, ()), "sub": (3, native_regex_sub, ()), "sub_n": (4, native_regex_sub_n, ()),
+        "pieces": (2, native_regex_pieces, ()), "pieces_n": (3, native_regex_pieces_n, ()),
+        "escape": (1, native_regex_escape, ()),
+    }, metered=("test", "match", "match_from", "find_all", "find_n", "sub", "sub_n", "pieces", "pieces_n", "escape")),
+    "files": _natives("files", {
+        "size": (1, native_files_size, READ_PATH), "is_dir": (1, native_files_is_dir, READ_PATH),
+        "is_link": (1, native_files_is_link, READ_PATH), "next_lines": (3, native_files_next_lines, READ_PATH),
+        "sha256_file": (1, native_files_sha256_file, READ_PATH),
+    }, metered=("sha256_file",)),
+}
+
+
+def native_call(args, position, interpreter=None):
+    """`native_call("module.name", [arguments], string_limit, work)`: how the self-hosted interpreter reaches a
+    native. It passes its own string limit (0 for none), which the host cannot see, and `work`, its function that
+    counts the units of work a native reports; `interpreter` is the host interpreter that runs the engine."""
+    qualified, call_args, limit, work = args
+    module, _, name = qualified.partition(".")
+    function = NATIVE_FUNCTIONS[module][name]
+    if function.arity is not None and len(call_args) != function.arity:
+        raise NovaError("{}() expects {} argument(s) but got {}".format(name, function.arity, len(call_args)), position)
+    result = function.implementation(call_args, position, _HostView(interpreter, work) if interpreter is not None else _NO_LIMITS)
+    native_check_size(result, limit, position)
+    return result
+
+
+class _NoLimits:
+    """Stands in for the interpreter when the self-hosted engine calls a native: its limits are its own."""
+    counting = False
+
+    def step(self, position=None):
+        pass
+
+    def charge(self, units, position=None):
+        pass
+
+
+_NO_LIMITS = _NoLimits()
 
 
 def resolve_package(name, start_dir, position):
@@ -4903,7 +7187,7 @@ def resolve_package(name, start_dir, position):
     directory = os.path.abspath(start_dir or os.getcwd())
     searched = []
     while True:
-        package = os.path.join(directory, PACKAGE_DIR, name)
+        package = os.path.join(directory, PACKAGE_DIR, *name.split("/"))
         if os.path.isfile(os.path.join(package, "nova.json")):
             break
         searched.append(os.path.join(directory, PACKAGE_DIR))
@@ -4993,8 +7277,10 @@ def default_module_name(raw_path, position):
     """The name a bare `import "path.nova"` binds, absent an alias. A
     package binds its name with '-' and '.' made '_': "math-utils" binds
     math_utils."""
-    if is_package_import(raw_path):
-        stem = raw_path.replace("-", "_").replace(".", "_")
+    if is_std_import(raw_path):
+        stem = raw_path[len(STD_PREFIX):]
+    elif is_package_import(raw_path):
+        stem = raw_path.rsplit("/", 1)[-1].replace("-", "_").replace(".", "_")
     else:
         stem = os.path.splitext(os.path.basename(raw_path))[0]
     if not is_bare_name(stem):
@@ -7000,11 +9286,23 @@ def typecheck_tool():
 
 def run(source, interpreter, path=None):
     """Lex, parse, type-gate and run `source`; (ast, value). `path` is the
-    module's absolute path when this is a module load."""
+    module's absolute path when this is a module load. When the interpreter
+    has an artifact cache (docs/spec/17-bytecode.md [bc.cache]: a command-line
+    program or a module it imports, on the bytecode VM), a hit skips lexing,
+    parsing and compiling - never the type gate - and a miss writes the entry."""
     try:
+        cache = interpreter.artifact_cache if interpreter.engine == "vm" else None
+        if cache is not None:
+            loaded = cache.lookup(source)
+            if loaded is not None and loaded is not CACHE_REJECTED:
+                program = LoadedProgram(loaded.annotated, loaded.imports, loaded.code)
+                type_gate(program, source, interpreter, path)
+                return program, run_program(program, interpreter)
         tokens = Lexer(source).tokenize()
         ast = Parser(tokens).parse()
         type_gate(ast, source, interpreter, path)
+        if cache is not None:
+            cache.store(source, ast, replacing=loaded is CACHE_REJECTED)
         return ast, run_program(ast, interpreter)
     except RecursionError:
         # A program nested too deeply to lex, parse or run: a NovaLang error, never Python's
@@ -7089,7 +9387,7 @@ def render_tree(node):
 # ---------------------------------------------------------------------------
 
 WELCOME = """╔═══════════════════════════════════╗
-║       NOVALANG v2.2.0            ║
+║       NOVALANG v2.4.0            ║
 ║   A star-born programming lang   ║
 ║   Type an expression or 'exit'   ║
 ╚═══════════════════════════════════╝"""
@@ -7392,6 +9690,1141 @@ def show_vars(interpreter):
 
 
 # ---------------------------------------------------------------------------
+# Bytecode artifacts (.novac)  -  M12 slice 4
+# ---------------------------------------------------------------------------
+#
+# A compiled module written down so a later run can skip lexing, parsing and compiling, and so a program can be
+# shipped as one self-contained file: the artifact carries the source text it was compiled from. The contract is
+# docs/spec/17-bytecode.md (sections [bc.*]); the rules in short:
+#
+#   * a purpose-built, length-prefixed, little-endian binary format, never pickle or marshal, read by explicit code;
+#   * a closed set of constant types; no object reference of any kind; built-ins are named, never pointed at;
+#   * the loader checks everything the VM would otherwise trust (V1 to V14), and every way a file can be wrong is
+#     one named BytecodeLoadError: accepted, or cleanly rejected, never misread;
+#   * the same source and compiler give the same bytes (so a check is "recompile and compare").
+#
+# An artifact is not a security boundary and its checksum is not a signature: it detects accident, not tampering.
+
+ARTIFACT_MAGIC = b"NOVAC\r\n\x1a"
+ARTIFACT_FORMAT = 0             # development builds write 0; the first release writes 1 and a loader reads only its own
+ARTIFACT_LIMITS = {
+    "artifact": 64 * 1024 * 1024,       # bytes in a file
+    "string": 16 * 1024 * 1024,         # bytes in a name, a text constant or the source
+    "integer": 1661,                    # bytes of an integer's magnitude (4,000 decimal digits)
+    "instructions": 4194304,            # per code object
+    "pool": 1048576,                    # constants per code object
+    "slots": 1048576,                   # nslots per code object
+    "operands": 1048576,                # a count, a chain, a list of slots or keys
+    "depth": 256,                       # nested code objects
+    "objects": 65536,                   # code objects per file
+    "version": 64,                      # bytes of the compiler version string
+}
+
+# (opcode, argument kind, stack effect text) in opcode order: the table of [bc.ops]. tests/compiler/test_bytecode_draft.py
+# checks it against OPCODES, STACK_EFFECT and the document.
+ARTIFACT_TABLE = (
+    ('LOAD_CONST', 'const', '+1'),
+    ('POP', '-', '-1'),
+    ('DUP', '-', '+1'),
+    ('LOAD_FAST', 'slot', '+1'),
+    ('STORE_FAST', 'slot', '-1'),
+    ('LOAD_CELL', 'slot', '+1'),
+    ('STORE_CELL', 'slot', '-1'),
+    ('LOAD_GLOBAL', 'name', '+1'),
+    ('STORE_GLOBAL', 'name', '-1'),
+    ('LOAD_CHAIN', 'chain', '+1'),
+    ('STORE_CHAIN', 'chain', '-1'),
+    ('NEW_CELLS', 'slots', '0'),
+    ('RESET_SLOTS', 'slots', '0'),
+    ('LOAD_BUILTIN', 'name', '+1'),
+    ('ADD', '-', '-1'),
+    ('SUB', '-', '-1'),
+    ('MUL', '-', '-1'),
+    ('DIV', '-', '-1'),
+    ('FLOOR_DIV', '-', '-1'),
+    ('MOD', '-', '-1'),
+    ('NEG', '-', '0'),
+    ('POS', '-', '0'),
+    ('NOT', '-', '0'),
+    ('EQ', '-', '-1'),
+    ('NE', '-', '-1'),
+    ('LT', '-', '-1'),
+    ('GT', '-', '-1'),
+    ('LE', '-', '-1'),
+    ('GE', '-', '-1'),
+    ('IN', '-', '-1'),
+    ('CHECK_BOOL', 'sideop', '0'),
+    ('JUMP_IF_FALSE_KEEP', 'target', '-1 (0 if taken)'),
+    ('JUMP_IF_TRUE_KEEP', 'target', '-1 (0 if taken)'),
+    ('BUILD_LIST', 'count', '1 - n'),
+    ('BUILD_DICT', 'keys', '1 - n'),
+    ('BUILD_STRING', 'count', '1 - n'),
+    ('INDEX', '-', '-1'),
+    ('SLICE_TARGET', '-', '0'),
+    ('SLICE_BOUND', '-', '0'),
+    ('SLICE', 'flags2', '- (flags set)'),
+    ('GET_MEMBER', 'name', '0'),
+    ('INDEX_ASSIGN_TARGET', '-', '0'),
+    ('INDEX_ASSIGN_KEY', '-', '0'),
+    ('INDEX_ASSIGN', '-', '-2'),
+    ('MEMBER_ASSIGN_TARGET', '-', '0'),
+    ('SET_MEMBER', 'name', '-1'),
+    ('DELETE_TARGET', '-', '0'),
+    ('DELETE_KEY', '-', '-1'),
+    ('DELETE_FILE', '-', '0'),
+    ('JUMP', 'target', '0'),
+    ('JUMP_IF_NOT_TRUE', 'condtarget', '-1'),
+    ('LOOP_NUMBER', 'role', '0'),
+    ('RANGE_PREP', 'rangeprep', '-(2 + step flag)'),
+    ('RANGE_NEXT', 'slottarget', '0 if taken, +1 otherwise'),
+    ('ITER_PREP', 'iterprep', '-1'),
+    ('ITER_NEXT', 'slottarget', '0 if taken, +names otherwise'),
+    ('MAKE_FUNCTION', 'const', '+1'),
+    ('CALL', 'count', '-n'),
+    ('RETURN', '-', '-1'),
+    ('THROW', '-', '-1'),
+    ('RERAISE', 'slot', '0'),
+    ('STRAY', 'stray', '0'),
+    ('FAIL', 'failtext', '0'),
+    ('IMPORT', 'name', '+1'),
+    ('IMPORT_NAME', 'importname', '0'),
+    ('EXPORT', 'name', '0'),
+)
+ARTIFACT_KIND = {name: kind for name, kind, _ in ARTIFACT_TABLE}
+ARTIFACT_CHAIN_KINDS = ("fast", "cell", "free", "global")
+ARTIFACT_CONDITIONS = ("if", "while")
+ARTIFACT_ROLES = ("the start of a 'for' range", "the end of a 'for' range", "a 'for' step")
+ARTIFACT_STRAYS = ("return", "break", "continue")
+ARTIFACT_SIDES = ("left", "right")
+ARTIFACT_LOGIC = ("and", "or")
+ARTIFACT_NO_POSITION = 0xFFFFFFFF
+
+
+class BytecodeLoadError(Exception):
+    """Why an artifact was refused: `name` is the stable name of [bc.reject], `str(error)` its message."""
+
+    def __init__(self, name, message):
+        super().__init__(message)
+        self.name = name
+
+
+class BytecodeDumpError(Exception):
+    """A code object that cannot be written down (a limit of [bc.limits], or a shape the format does not know):
+    the program is simply not cached and runs from source."""
+
+
+def artifact_opcode_hash():
+    """SHA-256 of the canonical text of the opcode table ([bc.header]): one line per opcode, `number name kind effect r<revision>`."""
+    import hashlib
+    text = "".join("{} {} {} {} r1\n".format(number, name, kind, effect)
+                   for number, (name, kind, effect) in enumerate(ARTIFACT_TABLE))
+    return hashlib.sha256(text.encode("utf-8")).digest()
+
+
+def bytecode_flags(program):
+    return (1 if getattr(program, "annotated", False) else 0) | (2 if getattr(program, "imports", False) else 0)
+
+
+# -- writing ----------------------------------------------------------------------------------------
+
+class ArtifactWriter:
+    def __init__(self):
+        self.parts = []
+
+    def u8(self, value):
+        self.parts.append(bytes((value,)))
+
+    def u32(self, value):
+        if not 0 <= value <= 0xFFFFFFFF:
+            raise BytecodeDumpError("a number does not fit 32 bits")
+        self.parts.append(value.to_bytes(4, "little"))
+
+    def raw(self, data):
+        self.parts.append(data)
+
+    def name(self, text):
+        try:
+            data = text.encode("utf-8")
+        except (UnicodeEncodeError, AttributeError):
+            raise BytecodeDumpError("text that is not valid UTF-8") from None
+        if len(data) > ARTIFACT_LIMITS["string"]:
+            raise BytecodeDumpError("text too long")
+        self.u32(len(data))
+        self.raw(data)
+
+    def bytes(self):
+        return b"".join(self.parts)
+
+
+def pool_key(value):
+    if isinstance(value, CodeObject):
+        return ("code", id(value))
+    if isinstance(value, BuiltinFunction):
+        return ("builtin", value.name)
+    if value is NOTHING:
+        return ("nothing",)
+    if isinstance(value, float):
+        import struct
+        return ("float", struct.pack("<d", value))
+    return (type(value).__name__, value)
+
+
+def encode_constant(value, out, depth, counter):
+    if value is NOTHING:
+        out.u8(0)
+    elif value is False:
+        out.u8(1)
+    elif value is True:
+        out.u8(2)
+    elif isinstance(value, int):
+        out.u8(3)
+        out.u8(1 if value < 0 else 0)
+        magnitude = abs(value).to_bytes((abs(value).bit_length() + 7) // 8, "little")
+        if len(magnitude) > ARTIFACT_LIMITS["integer"]:
+            raise BytecodeDumpError("an integer too large")
+        out.u32(len(magnitude))
+        out.raw(magnitude)
+    elif isinstance(value, float):
+        import struct
+        if value != value:
+            raise BytecodeDumpError("a constant that is not a number")
+        out.u8(4)
+        out.raw(struct.pack("<d", value))
+    elif isinstance(value, str):
+        out.u8(5)
+        out.name(value)
+    elif isinstance(value, BuiltinFunction):
+        if BUILTINS.get(value.name) is not value or value.name in CAPABILITY_OF:
+            raise BytecodeDumpError("a built-in that cannot be named: {}".format(value.name))
+        out.u8(6)
+        out.name(value.name)
+    elif isinstance(value, CodeObject):
+        out.u8(7)
+        encode_code(value, out, depth + 1, counter)
+    else:
+        raise BytecodeDumpError("a constant of a kind the format does not have: {}".format(type(value).__name__))
+
+
+def encode_code(code, out, depth, counter):
+    if depth > ARTIFACT_LIMITS["depth"]:
+        raise BytecodeDumpError("functions nested more than {} deep".format(ARTIFACT_LIMITS["depth"]))
+    counter[0] += 1
+    if counter[0] > ARTIFACT_LIMITS["objects"]:
+        raise BytecodeDumpError("more than {} functions".format(ARTIFACT_LIMITS["objects"]))
+    count = len(code.ops)
+    if count > ARTIFACT_LIMITS["instructions"] or code.nslots > ARTIFACT_LIMITS["slots"]:
+        raise BytecodeDumpError("a function too large")
+    out.name(code.name)
+    out.u32(code.nslots)
+    out.u32(len(code.params))
+    for slot in code.params:
+        out.u32(slot)
+    out.u32(len(code.param_names))
+    for text in code.param_names:
+        out.name(text)
+    out.u32(len(code.cell_params))
+    for slot in code.cell_params:
+        out.u32(slot)
+    out.u32(len(code.slot_names))
+    for text in code.slot_names:
+        out.name(text)
+    out.u32(len(code.freevars))
+    for text in code.freevars:
+        out.name(text)
+    out.u32(len(code.closure))
+    for kind, where in code.closure:
+        if kind not in ("cell", "free") or not isinstance(where, int):
+            raise BytecodeDumpError("a closure entry the format does not know")
+        out.u8(1 if kind == "cell" else 2)
+        out.u32(where)
+    # Instructions first into a side buffer, so the pool is built in order of first use (and so deterministically).
+    pool, seen = [], {}
+
+    def pool_ref(value):
+        key = pool_key(value)
+        if key not in seen:
+            seen[key] = len(pool)
+            pool.append(value)
+        return seen[key]
+
+    body = ArtifactWriter()
+    for index in range(count):
+        number = code.ops[index]
+        name = OPCODES[number]
+        kind = ARTIFACT_KIND[name]
+        arg = code.args[index]
+        body.u8(number)
+        encode_argument(kind, name, arg, code, pool_ref, body)
+    out.u32(len(pool))
+    if len(pool) > ARTIFACT_LIMITS["pool"]:
+        raise BytecodeDumpError("a pool too large")
+    for value in pool:
+        encode_constant(value, out, depth, counter)
+    out.u32(count)
+    out.raw(body.bytes())
+    for position in code.positions:
+        if position is None:
+            out.u32(ARTIFACT_NO_POSITION)
+        elif isinstance(position, int) and 0 <= position < ARTIFACT_NO_POSITION:
+            out.u32(position)
+        else:
+            raise BytecodeDumpError("a source position the format does not know")
+    out.u32(len(code.exception_table))
+    for start, end, handler, kind in code.exception_table:
+        out.u32(start)
+        out.u32(end)
+        out.u32(handler)
+        out.u8({"catch": 0, "finally": 1}[kind])
+
+
+def encode_argument(kind, name, arg, code, pool_ref, out):
+    constants = code.constants
+    if kind == "-":
+        if arg is not None:
+            raise BytecodeDumpError("an argument where there is none")
+    elif kind in ("slot", "count", "target"):
+        out.u32(arg)
+    elif kind == "const":
+        out.u32(pool_ref(constants[arg]))
+    elif kind == "name":
+        out.name(arg if name in ("LOAD_GLOBAL", "STORE_GLOBAL", "LOAD_BUILTIN") else constants[arg])
+    elif kind == "chain":
+        chain = constants[arg]
+        out.u32(len(chain))
+        for place, where in chain:
+            out.u8(ARTIFACT_CHAIN_KINDS.index(place))
+            if place == "global":
+                out.name(where)
+            else:
+                out.u32(where)
+    elif kind == "slots":
+        out.u32(len(constants[arg]))
+        for slot in constants[arg]:
+            out.u32(slot)
+    elif kind == "keys":
+        out.u32(len(constants[arg]))
+        for key in constants[arg]:
+            out.name(key)
+    elif kind == "sideop":
+        side, logic = constants[arg]
+        out.u8(ARTIFACT_SIDES.index(side))
+        out.u8(ARTIFACT_LOGIC.index(logic))
+    elif kind == "flags2":
+        out.u8(1 if arg[0] else 0)
+        out.u8(1 if arg[1] else 0)
+    elif kind == "condtarget":
+        out.u8(ARTIFACT_CONDITIONS.index(constants[arg[0]]))
+        out.u32(arg[1])
+    elif kind == "role":
+        out.u8(ARTIFACT_ROLES.index(constants[arg]))
+    elif kind == "rangeprep":
+        out.u32(arg[0])
+        out.u8(1 if arg[1] else 0)
+        out.u8(1 if arg[2] else 0)
+    elif kind == "slottarget":
+        out.u32(arg[0])
+        out.u32(arg[1])
+    elif kind == "iterprep":
+        out.u32(arg[0])
+        out.u8(arg[1])
+    elif kind == "stray":
+        out.u8(ARTIFACT_STRAYS.index(constants[arg]))
+    elif kind in ("failtext", "importname"):
+        first, second = constants[arg]
+        out.name(first)
+        out.name(second)
+    else:
+        raise BytecodeDumpError("an argument kind the format does not know: {}".format(kind))
+
+
+def dump_artifact(code, source, flags=0):
+    """The bytes of an artifact for `code`, compiled from `source` (a str) with the given flags."""
+    import hashlib
+    source_bytes = source.encode("utf-8", "strict") if isinstance(source, str) else None
+    if source_bytes is None:
+        raise BytecodeDumpError("source must be text")
+    body = ArtifactWriter()
+    encode_code(code, body, 1, [0])
+    body_bytes = body.bytes()
+    version = __version__.encode("utf-8")
+    if len(version) > ARTIFACT_LIMITS["version"]:
+        raise BytecodeDumpError("version string too long")
+    head = ArtifactWriter()
+    head.raw(ARTIFACT_MAGIC)
+    head.u32(ARTIFACT_FORMAT)
+    head.raw(artifact_opcode_hash())
+    head.u32(len(version))
+    head.raw(version)
+    head.u32(flags)
+    head.raw(hashlib.sha256(source_bytes).digest())
+    head.u32(len(source_bytes))
+    head.raw(source_bytes)
+    head.u32(len(body_bytes))
+    head.raw(body_bytes)
+    data = head.bytes()
+    if len(data) + 32 > ARTIFACT_LIMITS["artifact"]:
+        raise BytecodeDumpError("an artifact over {} bytes".format(ARTIFACT_LIMITS["artifact"]))
+    return data + hashlib.sha256(data).digest()
+
+
+def compile_artifact(source):
+    """Lex, parse and compile `source` and write the artifact. NovaError for a program that does not compile;
+    BytecodeDumpError for one that cannot be written down."""
+    program = Parser(Lexer(source).tokenize()).parse()
+    return dump_artifact(compile_ast(program), source, bytecode_flags(program))
+
+
+# -- reading ----------------------------------------------------------------------------------------
+
+def artifact_error(name, text):
+    return BytecodeLoadError(name, "bytecode artifact: " + text)
+
+
+class ArtifactReader:
+    def __init__(self, data, start, end):
+        self.data = data
+        self.at = start
+        self.end = end
+
+    def left(self):
+        return self.end - self.at
+
+    def take(self, count):
+        if count < 0 or count > self.left():
+            raise artifact_error("truncated", "truncated")
+        piece = self.data[self.at:self.at + count]
+        self.at += count
+        return piece
+
+    def u8(self):
+        return self.take(1)[0]
+
+    def flag(self):
+        value = self.u8()
+        if value > 1:
+            raise artifact_error("bad-constant", "bad constant")
+        return value == 1
+
+    def u32(self):
+        return int.from_bytes(self.take(4), "little")
+
+    def count(self, width=1, limit="operands"):
+        """A list length, checked against the limit and against the bytes that remain before anything is allocated."""
+        n = self.u32()
+        if n > ARTIFACT_LIMITS[limit]:
+            raise artifact_error("limit-exceeded", "too large ({})".format(limit))
+        if n * width > self.left():
+            raise artifact_error("truncated", "truncated")
+        return n
+
+    def name(self, limit="string"):
+        length = self.u32()
+        if length > ARTIFACT_LIMITS[limit]:
+            raise artifact_error("limit-exceeded", "too large ({})".format(limit))
+        try:
+            return self.take(length).decode("utf-8")
+        except UnicodeDecodeError:
+            raise artifact_error("bad-text", "text is not valid UTF-8") from None
+
+
+class LoadedArtifact:
+    """What load_artifact returns: the code object, the embedded source, the flags and the compiler that made it."""
+
+    def __init__(self, code, source, flags, compiler):
+        self.code = code
+        self.source = source
+        self.flags = flags
+        self.annotated = bool(flags & 1)
+        self.imports = bool(flags & 2)
+        self.compiler = compiler
+
+
+class ArtifactFrame:
+    """The little a CodeObject needs from the compiler's frame, rebuilt from the file."""
+
+    def __init__(self, slot_names, free_names):
+        self.slot_names = slot_names
+        self.freevars = [type("Free", (), {"name": text})() for text in free_names]
+
+
+def failed_verify(number):
+    return artifact_error("failed-verify", "failed verification (V{})".format(number))
+
+
+def load_artifact(data, expect_source=None):
+    """Read, check and rebuild an artifact: a LoadedArtifact, or a BytecodeLoadError with the name of [bc.reject].
+    `expect_source`, when given, is the source the caller is about to run: the embedded copy must be identical.
+    Anything unexpected inside the reader is converted to `internal-error` (the containment rule): nothing else escapes."""
+    try:
+        return read_artifact(data, expect_source)
+    except BytecodeLoadError:
+        raise
+    except Exception:               # noqa: BLE001 - the containment rule of [bc.verify]
+        raise artifact_error("internal-error", "internal error while reading") from None
+
+
+def read_artifact(data, expect_source):
+    import hashlib
+    if not isinstance(data, (bytes, bytearray)):
+        raise artifact_error("truncated", "truncated")
+    data = bytes(data)
+    if len(data) > ARTIFACT_LIMITS["artifact"]:
+        raise artifact_error("limit-exceeded", "too large (artifact)")
+    if len(data) < len(ARTIFACT_MAGIC):
+        raise artifact_error("truncated", "truncated")
+    if data[:len(ARTIFACT_MAGIC)] != ARTIFACT_MAGIC:
+        raise artifact_error("bad-magic", "not a NovaLang bytecode file")
+    if len(data) < len(ARTIFACT_MAGIC) + 32:
+        raise artifact_error("truncated", "truncated")
+    if hashlib.sha256(data[:-32]).digest() != data[-32:]:
+        raise artifact_error("checksum-mismatch", "checksum mismatch (the file is damaged)")
+    reader = ArtifactReader(data, len(ARTIFACT_MAGIC), len(data) - 32)
+    version = reader.u32()
+    if version != ARTIFACT_FORMAT:
+        raise artifact_error("unknown-format-version", "format version {} is not supported (this is {})".format(
+            version, ARTIFACT_FORMAT))
+    opcode_hash = reader.take(32)
+    compiler_text = reader.name("version")
+    if opcode_hash != artifact_opcode_hash():
+        raise artifact_error("opcode-set-mismatch", "made for a different instruction set (compiler {})".format(
+            compiler_text[:64]))
+    flags = reader.u32()
+    if flags & ~3:
+        raise artifact_error("bad-flags", "unknown flags")
+    source_hash = reader.take(32)
+    source_bytes = reader.take(reader.count(1, "string"))
+    if hashlib.sha256(source_bytes).digest() != source_hash:
+        raise artifact_error("source-mismatch", "made from a different source")
+    try:
+        source = source_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        raise artifact_error("bad-text", "text is not valid UTF-8") from None
+    if expect_source is not None and expect_source != source:
+        raise artifact_error("source-mismatch", "made from a different source")
+    body_length = reader.u32()
+    if body_length > reader.left():
+        raise artifact_error("truncated", "truncated")
+    if body_length < reader.left():
+        raise artifact_error("trailing-bytes", "unexpected bytes after the end")
+    state = {"objects": 0, "source_length": len(source)}
+    code = read_code(reader, 1, state, None)
+    if reader.left():
+        raise artifact_error("trailing-bytes", "unexpected bytes after the end")
+    try:
+        verify(code)                # V4, V6 and V12: jump targets, the stack depth on every path, nothing falls off the end
+    except BytecodeError:
+        raise failed_verify(6) from None
+    return LoadedArtifact(code, source, flags, compiler_text)
+
+
+def read_constant(reader, depth, state, parent_shape):
+    tag = reader.u8()
+    if tag == 0:
+        return NOTHING
+    if tag == 1:
+        return False
+    if tag == 2:
+        return True
+    if tag == 3:
+        negative = reader.flag()
+        length = reader.count(1, "integer")
+        magnitude = reader.take(length)
+        if length and magnitude[-1] == 0:
+            raise artifact_error("bad-constant", "bad constant")
+        if not length and negative:
+            raise artifact_error("bad-constant", "bad constant")
+        value = int.from_bytes(magnitude, "little")
+        return -value if negative else value
+    if tag == 4:
+        import struct
+        value = struct.unpack("<d", reader.take(8))[0]
+        if value != value:
+            raise artifact_error("bad-constant", "bad constant")
+        return value
+    if tag == 5:
+        return reader.name()
+    if tag == 6:
+        text = reader.name()
+        function = BUILTINS.get(text)
+        if function is None or text in CAPABILITY_OF or not isinstance(function, BuiltinFunction):
+            raise artifact_error("unknown-builtin", "unknown or gated built-in {}".format(text[:64]))
+        return function
+    if tag == 7:
+        return read_code(reader, depth + 1, state, parent_shape)
+    raise artifact_error("bad-constant", "bad constant")
+
+
+def read_code(reader, depth, state, parent):
+    """One code object. `parent` is None for the module, else (nslots, free-name count, slot roles' placeholder)."""
+    if depth > ARTIFACT_LIMITS["depth"]:
+        raise failed_verify(1)
+    state["objects"] += 1
+    if state["objects"] > ARTIFACT_LIMITS["objects"]:
+        raise artifact_error("limit-exceeded", "too large (objects)")
+    name = reader.name()
+    nslots = reader.u32()
+    if nslots > ARTIFACT_LIMITS["slots"]:
+        raise artifact_error("limit-exceeded", "too large (slots)")
+    params = [reader.u32() for _ in range(reader.count(4))]
+    if any(slot >= nslots for slot in params):
+        raise failed_verify(3)
+    param_names = [reader.name() for _ in range(reader.count(4))]
+    cell_params = [reader.u32() for _ in range(reader.count(4))]
+    if len(param_names) != len(params) or any(slot not in params for slot in cell_params):
+        raise failed_verify(10)
+    slot_names = [reader.name() for _ in range(reader.count(4))]
+    if len(slot_names) != nslots:
+        raise failed_verify(10)
+    free_names = [reader.name() for _ in range(reader.count(4))]
+    closure = []
+    for _ in range(reader.count(5)):
+        kind, where = reader.u8(), reader.u32()
+        if kind not in (1, 2):
+            raise failed_verify(11)
+        closure.append(("cell" if kind == 1 else "free", where))
+    if len(closure) != len(free_names):
+        raise failed_verify(10)
+    if parent is None:
+        if closure:
+            raise failed_verify(9)
+    else:
+        for kind, where in closure:
+            if where >= (parent[0] if kind == "cell" else parent[1]):
+                raise failed_verify(9)
+    shape = (nslots, len(free_names))
+    code = CodeObject(name, ArtifactFrame(slot_names, free_names))
+    code.nslots = nslots
+    code.params = params
+    code.param_names = param_names
+    code.cell_params = cell_params
+    code.closure = closure
+    # the pool, in file order; structured arguments are appended to it afterwards, as the compiler keeps them
+    code.constants = [read_constant(reader, depth, state, shape) for _ in range(reader.count(1, "pool"))]
+    pool_size = len(code.constants)
+    count = reader.count(1, "instructions")
+    ops, args = [], []
+    for _ in range(count):
+        number = reader.u8()
+        if number >= len(ARTIFACT_TABLE):
+            raise artifact_error("bad-opcode", "unknown instruction {}".format(number))
+        name_ = ARTIFACT_TABLE[number][0]
+        ops.append(number)
+        args.append(read_argument(ARTIFACT_TABLE[number][1], name_, reader, code, nslots, len(free_names), count, pool_size))
+    if count * 4 > reader.left():
+        raise artifact_error("truncated", "truncated")
+    positions = []
+    for _ in range(count):
+        position = reader.u32()
+        if position == ARTIFACT_NO_POSITION:
+            positions.append(None)
+        elif position >= state["source_length"]:
+            raise failed_verify(14)
+        else:
+            positions.append(position)
+    code.ops, code.args, code.positions = ops, args, positions
+    for _ in range(reader.count(13)):
+        start, end, handler, kind = reader.u32(), reader.u32(), reader.u32(), reader.u8()
+        if not (0 <= start < end <= count and handler < count) or kind > 1:
+            raise failed_verify(4)
+        code.exception_table.append((start, end, handler, "finally" if kind else "catch"))
+    check_artifact_code(code, shape)
+    return code
+
+
+def read_argument(kind, name, reader, code, nslots, nfree, count, pool_size):
+    def slot():
+        value = reader.u32()
+        if value >= nslots:
+            raise failed_verify(3)
+        return value
+
+    def target():
+        value = reader.u32()
+        if value >= count:
+            raise failed_verify(4)
+        return value
+
+    def choice(options):
+        value = reader.u8()
+        if value >= len(options):
+            raise failed_verify(11)
+        return options[value]
+
+    if kind == "-":
+        return None
+    if kind == "slot":
+        return slot()
+    if kind == "count":
+        value = reader.u32()
+        if value > ARTIFACT_LIMITS["operands"]:
+            raise failed_verify(7)
+        return value
+    if kind == "target":
+        return target()
+    if kind == "const":
+        index = reader.u32()
+        if index >= pool_size:
+            raise failed_verify(2)
+        is_code = isinstance(code.constants[index], CodeObject)
+        if is_code != (name == "MAKE_FUNCTION"):
+            raise failed_verify(2)
+        return index
+    if kind == "name":
+        text = reader.name()
+        return text if name in ("LOAD_GLOBAL", "STORE_GLOBAL", "LOAD_BUILTIN") else code.const(text)
+    if kind == "chain":
+        entries = []
+        for _ in range(reader.count(5)):
+            place = reader.u8()
+            if place >= len(ARTIFACT_CHAIN_KINDS):
+                raise failed_verify(11)
+            if place == 3:
+                entries.append(("global", reader.name()))
+            else:
+                where = reader.u32()
+                if where >= (nfree if place == 2 else nslots):
+                    raise failed_verify(5)
+                entries.append((ARTIFACT_CHAIN_KINDS[place], where))
+        if not entries:
+            raise failed_verify(5)
+        return code.const(tuple(entries))
+    if kind == "slots":
+        slots = tuple(slot() for _ in range(reader.count(4)))
+        if not slots:
+            raise failed_verify(3)
+        return code.const(slots)
+    if kind == "keys":
+        return code.const(tuple(reader.name() for _ in range(reader.count(4))))
+    if kind == "sideop":
+        side = choice(ARTIFACT_SIDES)
+        logic = choice(ARTIFACT_LOGIC)
+        return code.const((side, logic))
+    if kind == "flags2":
+        return (reader.flag(), reader.flag())
+    if kind == "condtarget":
+        condition = choice(ARTIFACT_CONDITIONS)
+        return (code.const(condition), target())
+    if kind == "role":
+        return code.const(choice(ARTIFACT_ROLES))
+    if kind == "rangeprep":
+        return (slot(), reader.flag(), reader.flag())
+    if kind == "slottarget":
+        return (slot(), target())
+    if kind == "iterprep":
+        first = slot()
+        names = reader.u8()
+        if names not in (1, 2):
+            raise failed_verify(11)
+        return (first, names)
+    if kind == "stray":
+        return code.const(choice(ARTIFACT_STRAYS))
+    if kind in ("failtext", "importname"):
+        first = reader.name()
+        second = reader.name()
+        return code.const((first, second))
+    raise artifact_error("bad-argument", "bad argument")
+
+
+def check_artifact_code(code, shape):
+    """What `verify()` does not check and the VM trusts ([bc.findings] F4): each slot has one role, the closure of each
+    nested function names cells of this one, the loop state is prepared on every path to its use (V3, V8, V9)."""
+    nslots = shape[0]
+    roles = {}
+
+    def role(slot, what):
+        if roles.setdefault(slot, what) != what:
+            raise failed_verify(3)
+
+    for slot in code.params:
+        role(slot, "cell" if slot in code.cell_params else "plain")
+    for index, number in enumerate(code.ops):
+        name = OPCODES[number]
+        arg = code.args[index]
+        if name in ("LOAD_FAST", "STORE_FAST", "RERAISE"):
+            role(arg, "plain")
+        elif name in ("LOAD_CELL", "STORE_CELL"):
+            role(arg, "cell")
+        elif name == "NEW_CELLS":
+            for slot in code.constants[arg]:
+                role(slot, "cell")
+        elif name == "RESET_SLOTS":
+            for slot in code.constants[arg]:
+                role(slot, "plain")
+        elif name in ("LOAD_CHAIN", "STORE_CHAIN"):
+            for place, where in code.constants[arg]:
+                if place == "fast":
+                    role(where, "plain")
+                elif place == "cell":
+                    role(where, "cell")
+        elif name in ("RANGE_PREP", "RANGE_NEXT", "ITER_PREP", "ITER_NEXT"):
+            role(arg[0], "state")
+    for constant in code.constants:
+        if isinstance(constant, CodeObject):
+            for kind, where in constant.closure:
+                if kind == "cell":
+                    role(where, "cell")
+    # loop state: ITER_PREP names counts agree per slot, and every ITER_NEXT / RANGE_NEXT is reached with its state prepared
+    names_of = {}
+    uses = False
+    for index, number in enumerate(code.ops):
+        name = OPCODES[number]
+        if name == "ITER_PREP":
+            if names_of.setdefault(code.args[index][0], code.args[index][1]) != code.args[index][1]:
+                raise failed_verify(8)
+        if name in ("ITER_NEXT", "RANGE_NEXT", "RANGE_PREP", "ITER_PREP"):
+            uses = True
+    if uses:
+        check_loop_state(code)
+
+
+def check_loop_state(code):
+    """Forward data flow: the set of loop-state slots prepared on every path to each instruction (V8). A catch or finally
+    handler starts from what holds at every instruction of the range it protects."""
+    count = len(code.ops)
+    prepare = {OP["RANGE_PREP"], OP["ITER_PREP"]}
+    uses = {OP["RANGE_NEXT"], OP["ITER_NEXT"]}
+    unreached = None
+    state = [unreached] * count
+    handlers = {}
+    for start, end, handler, _ in code.exception_table:
+        handlers.setdefault(handler, []).append((start, end))
+    state[0] = frozenset()
+    work = [0]
+
+    def meet(target, incoming):
+        old = state[target]
+        new = incoming if old is unreached else old & incoming
+        if new != old:
+            state[target] = new
+            work.append(target)
+
+    guard = 0
+    while work:
+        guard += 1
+        if guard > 50 * (count + 1) + 1000:
+            raise failed_verify(8)          # not converging: refuse rather than loop
+        index = work.pop()
+        here = state[index]
+        op = code.ops[index]
+        if op in uses and code.args[index][0] not in here:
+            raise failed_verify(8)
+        out = here | {code.args[index][0]} if op in prepare else here
+        if op in JUMPS:
+            meet(jump_target(code, index), out)
+        if op not in ENDS_FLOW and index + 1 < count:
+            meet(index + 1, out)
+        for handler, ranges in handlers.items():
+            if any(start <= index < end for start, end in ranges):
+                meet(handler, here)
+
+
+def run_artifact_bytes(data, origin, script_args):
+    """Run an artifact in this process: the embedded source is the program's source, the type gate runs on it when the
+    flags say it has annotations or imports, and the loaded code runs on the VM, under the profile of the command line.
+    The containment rule: anything that is not a NovaError leaving the VM while it runs loaded code is an `InternalError`,
+    exit status 70 ([bc.questions] Q4)."""
+    global SCRIPT_ARGS
+    try:
+        artifact = load_artifact(data)
+    except BytecodeLoadError as error:
+        print("{}: {}".format(origin, error), file=sys.stderr)
+        return 1
+    if DEFAULT_ENGINE != "vm":
+        print("a bytecode artifact runs on the bytecode VM only, not on the tree-walker", file=sys.stderr)
+        return 2
+    SCRIPT_ARGS = list(script_args or [])
+    interpreter = Interpreter()
+    interpreter.file_stack.append(os.path.dirname(os.path.abspath(origin)))
+    source = artifact.source
+    program = LoadedProgram(artifact.annotated, artifact.imports, artifact.code)
+    try:
+        type_gate(program, source, interpreter, None)
+        run_program(program, interpreter)
+    except ProgramExit as stop:
+        return stop.code
+    except FatalLimit as fatal:
+        print("{}\n{}".format(origin, fatal.render(source)), file=sys.stderr)
+        return 1
+    except NovaError as error:
+        print("{}\n{}".format(origin, error.render(source)), file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\n(stopped)", file=sys.stderr)
+        return 130
+    except RecursionError:
+        print("NovaError: the interpreter ran out of stack - recursion too deep", file=sys.stderr)
+        return 1
+    except BrokenPipeError:
+        raise
+    except Exception as problem:        # noqa: BLE001 - the containment rule: never a traceback from loaded code
+        print("InternalError: {}".format(type(problem).__name__), file=sys.stderr)
+        return 70
+    return 0
+
+
+def compile_main(arguments):
+    """`--compile FILE.nova -o FILE.novac`: write the artifact of a program. Nothing is run."""
+    if len(arguments) != 3 or arguments[1] != "-o":
+        print("usage: novalang.py --compile file.nova -o file.novac", file=sys.stderr)
+        return 2
+    path, output = arguments[0], arguments[2]
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            source = handle.read()
+    except (OSError, UnicodeDecodeError) as problem:
+        print("cannot read {}: {}".format(path, problem), file=sys.stderr)
+        return 2
+    try:
+        data = compile_artifact(source)
+    except NovaError as error:
+        print(path, file=sys.stderr)
+        print(error.render(source), file=sys.stderr)
+        return 1
+    except BytecodeDumpError as error:
+        print("{}: cannot write a bytecode artifact: {}".format(path, error), file=sys.stderr)
+        return 1
+    temporary = output + ".tmp"
+    try:
+        with open(temporary, "wb") as handle:
+            handle.write(data)
+        os.replace(temporary, output)
+    except OSError as problem:
+        print("cannot write {}: {}".format(output, problem), file=sys.stderr)
+        return 2
+    return 0
+
+
+def check_artifact_main(arguments):
+    """`--check-artifact FILE.novac`: recompile the embedded source and compare the bytes (the format is deterministic), so
+    the code is known to be the compilation of that source ([bc.provenance])."""
+    if len(arguments) != 1:
+        print("usage: novalang.py --check-artifact file.novac", file=sys.stderr)
+        return 2
+    try:
+        with open(arguments[0], "rb") as handle:
+            data = handle.read(ARTIFACT_LIMITS["artifact"] + 1)
+    except OSError as problem:
+        print("cannot read {}: {}".format(arguments[0], problem), file=sys.stderr)
+        return 2
+    try:
+        artifact = load_artifact(data)
+    except BytecodeLoadError as error:
+        print("{}: {}".format(arguments[0], error), file=sys.stderr)
+        return 1
+    try:
+        fresh = compile_artifact(artifact.source)
+    except (NovaError, BytecodeDumpError):
+        print("{}: the embedded source does not compile, so the code cannot be its compilation".format(arguments[0]), file=sys.stderr)
+        return 1
+    if fresh != data:
+        print("{}: the code is NOT the compilation of the embedded source (or it was made by a different compiler: {})".format(
+            arguments[0], artifact.compiler), file=sys.stderr)
+        return 1
+    print("{}: ok: the code is the compilation of the embedded source ({} bytes, compiler {})".format(
+        arguments[0], len(data), artifact.compiler))
+    return 0
+
+
+def is_artifact_file(path):
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(len(ARTIFACT_MAGIC)) == ARTIFACT_MAGIC
+    except OSError:
+        return False
+
+
+def run_artifact_file(path, script_args):
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(ARTIFACT_LIMITS["artifact"] + 1)
+    except OSError as problem:
+        print("cannot read {}: {}".format(path, problem), file=sys.stderr)
+        return 2
+    return run_artifact_bytes(data, path, script_args)
+
+
+# -- the compiled-artifact cache (M12 slice 5; docs/spec/17-bytecode.md [bc.cache]) ----------------------
+
+class LoadedProgram:
+    """What a run needs of a parse when the code comes from an artifact: whether the source has annotations or imports (so the type gate
+    runs when it must) and the code itself."""
+
+    def __init__(self, annotated, imports, code):
+        self.annotated, self.imports, self._code = annotated, imports, code
+
+
+CACHE_SETTINGS = {"disabled": False, "dir": None}       # --no-cache and --cache-dir, set by main()
+CACHE_REJECTED = object()                                # a file was there and could not be used: compile, and replace it
+_CACHES = {}
+
+
+def cache_key(source):
+    """The 64 hex digits that name the entry for `source` ([bc.cache]): SHA-256 over the format version, the opcode-set hash, the compiler
+    version and the source text, each preceded by its length as a u32. Not the profile, the limits, the path or the working directory."""
+    import hashlib
+    parts = (ARTIFACT_FORMAT.to_bytes(4, "little"), artifact_opcode_hash(), __version__.encode("utf-8"), source.encode("utf-8", "surrogatepass"))
+    return hashlib.sha256(b"".join(len(part).to_bytes(4, "little") + part for part in parts)).hexdigest()
+
+
+def default_cache_directory(environ=None):
+    """The per-user cache directory, or None where there is none ([bc.cache]). The cache is not available on Windows."""
+    environ = os.environ if environ is None else environ
+    if sys.platform == "win32":
+        return None
+    explicit = environ.get("XDG_CACHE_HOME")
+    if explicit and os.path.isabs(explicit):
+        return os.path.join(explicit, "novalang")
+    home = environ.get("HOME") or os.path.expanduser("~")
+    if not home or home == "~":
+        return None
+    if sys.platform == "darwin":
+        return os.path.join(home, "Library", "Caches", "novalang")
+    return os.path.join(home, ".cache", "novalang")
+
+
+def cache_switched_off(environ=None):
+    """`--no-cache` or NOVALANG_CACHE=off (also 0, false, no): the cache is off whatever else is said."""
+    environ = os.environ if environ is None else environ
+    return CACHE_SETTINGS["disabled"] or environ.get("NOVALANG_CACHE", "").strip().lower() in ("off", "0", "false", "no")
+
+
+def cache_for_run(capabilities=None, directory=None, environ=None):
+    """The ArtifactCache a command-line run uses, or None. On for the `trusted` profile; off for `restricted` unless the embedder named a
+    directory (`--cache-dir`): a restricted program must not choose where anything is written. Off with `--no-cache`, with
+    NOVALANG_CACHE=off, on Windows (directory ownership cannot be verified there yet), and when the directory is not safe ([bc.cache])."""
+    environ = os.environ if environ is None else environ
+    capabilities = DEFAULT_CAPABILITIES if capabilities is None else capabilities
+    directory = CACHE_SETTINGS["dir"] if directory is None else directory
+    if cache_switched_off(environ):
+        return None
+    if sys.platform == "win32":
+        if directory is not None and not CACHE_SETTINGS.get("warned"):
+            CACHE_SETTINGS["warned"] = True
+            print("novalang: the artifact cache is not available on Windows (the owner of a directory cannot be verified there); "
+                  "running without it", file=sys.stderr)
+        return None
+    if capabilities.restricted and directory is None:
+        return None
+    directory = directory or default_cache_directory(environ)
+    if not directory:
+        return None
+    directory = os.path.abspath(directory)
+    if directory not in _CACHES:
+        cache = ArtifactCache(directory, debug=bool(environ.get("NOVALANG_CACHE_DEBUG")))
+        _CACHES[directory] = cache if cache.prepare() else None
+        if _CACHES[directory] is None and cache.debug:
+            print("novalang cache: the directory cannot be used (it is not ours, is writable by others, or cannot be made): {}".format(directory),
+                  file=sys.stderr)
+    return _CACHES[directory]
+
+
+class ArtifactCache:
+    """A directory of artifacts named by cache_key. Nothing here can fail a program: every problem is a miss or a skipped write
+    ([bc.cache], Reading and Writing). The directory must be owned by the user and not writable by group or others; an entry is
+    read without following a link and must be a regular file of the user's, not writable by others; it is loaded with the full checks of
+    [bc.verify], with the source being run, so an entry that is for another source, damaged, or from another compiler is refused."""
+
+    def __init__(self, directory, debug=False):
+        self.directory = directory
+        self.debug = debug
+        self.counts = {"hit": 0, "miss": 0, "rejected": 0, "stored": 0}
+
+    def note(self, what, key):
+        self.counts[what] = self.counts.get(what, 0) + 1
+        if self.debug:
+            print("novalang cache: {} {}".format(what, key[:12]), file=sys.stderr)
+
+    def safe(self, status, directory):
+        import stat
+        if not (stat.S_ISDIR(status.st_mode) if directory else stat.S_ISREG(status.st_mode)):
+            return False                                    # a link, a socket, a file where a directory should be
+        if hasattr(os, "getuid") and status.st_uid != os.getuid():
+            return False
+        return not status.st_mode & 0o022                   # not writable by group or others
+
+    def prepare(self):
+        """Create the directory (mode 0700) if it is missing, and say whether it may be used."""
+        try:
+            try:
+                status = os.lstat(self.directory)
+            except FileNotFoundError:
+                os.makedirs(os.path.dirname(self.directory), exist_ok=True)
+                try:
+                    os.mkdir(self.directory, 0o700)
+                except FileExistsError:
+                    pass
+                status = os.lstat(self.directory)
+            return self.safe(status, True)
+        except OSError:
+            return False
+
+    def path(self, key):
+        return os.path.join(self.directory, key + ".novac")
+
+    def lookup(self, source):
+        """A LoadedArtifact for `source`; None for no entry; CACHE_REJECTED for an entry that must be replaced."""
+        key = cache_key(source)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        try:
+            descriptor = os.open(self.path(key), flags)
+        except OSError:
+            self.note("miss", key)
+            return None
+        try:
+            status = os.fstat(descriptor)
+            if not self.safe(status, False) or status.st_size > ARTIFACT_LIMITS["artifact"]:
+                raise ValueError("an entry that may not be read")
+            chunks, remaining = [], status.st_size + 1
+            while remaining > 0:
+                chunk = os.read(descriptor, min(remaining, 1 << 20))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            data = b"".join(chunks)
+        except (OSError, ValueError):
+            self.note("rejected", key)
+            return CACHE_REJECTED
+        finally:
+            os.close(descriptor)
+        try:
+            loaded = load_artifact(data, source)
+        except BytecodeLoadError as refusal:
+            self.note("rejected", key)
+            if self.debug:
+                print("novalang cache: {}".format(refusal.name), file=sys.stderr)
+            return CACHE_REJECTED
+        self.note("hit", key)
+        return loaded
+
+    def store(self, source, program, replacing=False):
+        """Compile `program` (the parse of `source`) and write its entry: to a temporary file made exclusively in the directory, then an atomic
+        replace. A program too large to write, a read-only directory, a full disk: skipped, silently."""
+        key = cache_key(source)
+        code = program._code = compile_ast(program)
+        try:
+            data = dump_artifact(code, source, bytecode_flags(program))
+        except BytecodeDumpError:
+            return
+        temporary = "{}.{}.{}.tmp".format(self.path(key), os.getpid(), os.urandom(4).hex())
+        try:
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0), 0o600)
+            try:
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(descriptor, view):]
+            finally:
+                os.close(descriptor)
+            os.replace(temporary, self.path(key))
+            self.note("stored", key)
+        except OSError:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -7400,6 +10833,7 @@ def run_source(source, origin, script_args=None):
     global SCRIPT_ARGS
     SCRIPT_ARGS = list(script_args or [])
     interpreter = Interpreter()
+    interpreter.artifact_cache = cache_for_run(interpreter.caps)
     # A relative import in this file resolves against its own directory first.
     interpreter.file_stack.append(os.path.dirname(os.path.abspath(origin)))
     try:
@@ -7617,6 +11051,18 @@ def dis_main(paths):
         return 2
     status = 0
     for path in paths:
+        if is_artifact_file(path):
+            try:
+                with open(path, "rb") as handle:
+                    loaded = load_artifact(handle.read(ARTIFACT_LIMITS["artifact"] + 1))
+            except (OSError, BytecodeLoadError) as problem:
+                print("{}: {}".format(path, problem), file=sys.stderr)
+                status = 2
+                continue
+            if len(paths) > 1:
+                print("== " + path)
+            print(disassemble(loaded.code, loaded.source))
+            continue
         try:
             with open(path, "r", encoding="utf-8") as handle:
                 source = handle.read()
@@ -7893,6 +11339,8 @@ def isolate_main(runner, forwarded, rest):
         sys.stderr.buffer.write(chunk)
         sys.stderr.buffer.flush()
 
+    if cache_switched_off() and "--no-cache" not in forwarded:
+        forwarded = forwarded + ["--no-cache"]       # the child's environment is clean: say it, or it would choose for itself
     status, killed = supervise(runner_command(forwarded, rest, memory_mb, wall_ms), runner_environment(runner.get("pass_env", ())),
                                inherit, wall_ms, output_cap, to_out, to_err)
     seen = b"".join(err).decode("utf-8", "replace")
@@ -7936,9 +11384,22 @@ def main(argv):
     sandbox = {}                            # docs/spec/16-sandbox.md [sbx.profiles]
     runner = {}                             # [sbx.runner]: --isolate and the flags that tune it
     forwarded = []                          # the flags the isolated child is given again
-    while args and (args[0] in ("--tree-walk", "--allow-python") or args[0] in SANDBOX_FLAGS
+    while args and (args[0] in ("--tree-walk", "--allow-python", "--no-cache", "--cache-dir") or args[0] in SANDBOX_FLAGS
                     or args[0] in RUNNER_FLAGS):
         flag = args[0]
+        if flag == "--no-cache":
+            CACHE_SETTINGS["disabled"] = True
+            forwarded.append(flag)
+            args = args[1:]
+            continue
+        if flag == "--cache-dir":
+            if len(args) < 2 or not args[1]:
+                print("--cache-dir needs a directory", file=sys.stderr)
+                return 2
+            CACHE_SETTINGS["dir"] = args[1]
+            forwarded.extend([flag, args[1]])
+            args = args[2:]
+            continue
         if flag in RUNNER_FLAGS:
             if flag == "--isolate":
                 runner["isolate"] = True
@@ -8024,11 +11485,19 @@ def main(argv):
         return typecheck_tool().main(["novalang.py --typecheck"] + args[1:])
     if args[0] == "--dis":
         return dis_main(args[1:])
+    if args[0] == "--compile":
+        return compile_main(args[1:])
+    if args[0] == "--check-artifact":
+        return check_artifact_main(args[1:])
     if args[0] == "--format":
         if len(args) < 2:
             print("usage: novalang.py --format file.nova [more.nova ...]", file=sys.stderr)
             return 2
         return load_tool("nova-fmt.py").main(["novalang.py --format", "--write"] + args[1:])
+
+    # `python3 novalang.py program.novac`: a bytecode artifact (a binary file starting with the magic), run as it is
+    if is_artifact_file(args[0]):
+        return unless_the_reader_left(run_artifact_file, args[0], args[1:])
 
     # `python3 novalang.py program.nova`  or  `python3 novalang.py "1 + 2"`
     text = None

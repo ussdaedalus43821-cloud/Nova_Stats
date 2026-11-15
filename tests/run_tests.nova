@@ -15,6 +15,7 @@ import "../src/modules/disk.nova" as disk
 import "../src/modules/net.nova" as net
 import "../src/modules/clock.nova" as clock
 import "../src/modules/battery.nova" as battery
+import "std:text" as text
 
 let tally = {passed: 0, failed: 0}
 
@@ -338,6 +339,15 @@ check("frame starts with cursor home", framed[:5], "<E>[H")
 check("frame ends with clear below", framed[-5:], "<E>[J")
 check("every line is cleared to its end", len(split(framed, "<E>[K")), len(plain) + 1)
 check("colour is applied", "<E>[32m" in framed, true)
+# The real escape character, made by the program (std:text.chr(27)) with no host: the same frame with <E> replaced,
+# and byte for byte the colour frame the host-supplied ESC gave before NovaLang 2.4 (tests/golden/term_discharging_color.txt).
+check("ESC is character 27", len(term.ESC) == 1 and text.ord(term.ESC) == 27, true)
+let real = term.frame(golden_snap, {esc: term.ESC, color: true})
+check("the real frame is the <E> frame with ESC", real, join(split(framed, "<E>"), term.ESC))
+if "--update" in args() {
+    write("tests/golden/term_discharging_color.txt", real)
+}
+check("colour frame matches the golden", real, read("tests/golden/term_discharging_color.txt"))
 
 let failed_view = term.render(broken, {esc: "", color: false})
 check("a failed module shows as unavailable", "  unavailable: simulated failure of ioreg" in failed_view, true)

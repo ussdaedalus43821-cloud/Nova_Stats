@@ -1,22 +1,32 @@
 # clock.nova - the clock reader (Stats: Modules/Clock).
-# format_time() only knows the machine's local zone and there is no zone database, so
-# other cities are fixed UTC offsets with no daylight-saving rules (docs/GAPS.md G-014).
+# The local time comes from format_time(), which follows the machine's zone and its daylight saving. The other
+# cities are fixed UTC offsets with no daylight-saving rules (docs/GAPS.md G-014: std:date deliberately has no zone
+# database). Everything else is std:date: a world time is the same instant written in another offset, and the
+# local offset is how far the machine's wall clock is from UTC at this instant.
 import "../kit.nova" as kit
+import "std:date" as date
 
-def at_offset(wall, hours) {
-    return format_time(wall + hours * 3600 - local_offset(wall) * 3600, "%H:%M")
+let WALL_FORMAT = "%Y-%m-%dT%H:%M:%S"
+
+# A UTC offset in hours (5.5, -5, 12.75) as std:date writes it: "+05:30", "-05:00", "+12:45".
+def offset_text(hours) {
+    let minutes = round(abs(hours) * 60)
+    let sign = "+"
+    if hours < 0 {
+        sign = "-"
+    }
+    return sign + kit.two(minutes // 60) + ":" + kit.two(minutes % 60)
 }
 
-# The local UTC offset, from the epoch itself: UTC minutes-of-day by arithmetic, local minutes-of-day from
-# format_time() (which follows the machine's zone and its daylight saving).
+def at_offset(wall, hours) {
+    return date.format(date.from_epoch(floor(wall), offset_text(hours)), "%H:%M")
+}
+
+# The local UTC offset in hours: the machine's wall clock read as if it were UTC, minus the real UTC instant.
 def local_offset(wall) {
-    let local_minutes = num(format_time(wall, "%H")) * 60 + num(format_time(wall, "%M"))
-    let utc_minutes = (wall // 60) % 1440
-    let diff = (local_minutes - utc_minutes) % 1440
-    if diff > 720 {
-        diff = diff - 1440
-    }
-    return diff / 60
+    let seconds = floor(wall)
+    let local = date.parse_timestamp_at(format_time(seconds, WALL_FORMAT), WALL_FORMAT, "+00:00")
+    return date.diff_seconds(local, date.from_epoch(seconds, "+00:00")) / 3600
 }
 
 export def sample(ctx, state) {
